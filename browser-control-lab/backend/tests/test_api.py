@@ -167,8 +167,14 @@ def test_stop_all_verifies_no_processes_remain(server):
     ids = [s["id"] for s in server.post("/api/sessions", json={"count": 3}).json()]
     server.post("/api/sessions/start-all")
     _wait(server, lambda st: all(_by_id(st, i)["process_count"] > 0 for i in ids))
-    procs = server.get("/api/processes").json()
-    assert procs["count"] >= 3 and procs["tracked_pids"] >= procs["count"] - 3
+    # The 1 s sampler records PIDs asynchronously; wait until it has seen the whole tree.
+    end = time.time() + 15
+    while True:
+        procs = server.get("/api/processes").json()
+        if procs["count"] >= 3 and procs["tracked_pids"] >= procs["count"]:
+            break
+        assert time.time() < end, procs
+        time.sleep(0.3)
     out = server.post("/api/sessions/stop-all").json()
     assert out["verified_clean"] is True and out["remaining_processes"] == 0
     assert server.get("/api/processes").json()["count"] == 0
