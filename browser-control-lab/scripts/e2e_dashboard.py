@@ -58,9 +58,13 @@ def main() -> int:
         expect(page.get_by_text("실시간 연결")).to_be_visible(timeout=15000)
         print("✓ dashboard connected over WebSocket")
 
+        expect(page.get_by_text("테스트 브라우저 메모리")).to_be_visible()
+        expect(page.get_by_text("메모리 압력 · Swap")).to_be_visible()
+        print("✓ memory panels visible (system / test browsers / pressure+swap)")
+
         page.get_by_label("세션 수").fill(str(n))
-        page.get_by_role("button", name="세션 등록").click()
-        expect(page.get_by_text(f"{n}개 세션 등록")).to_be_visible()
+        page.get_by_role("button", name="세션 등록").click()  # empty lab: registers directly
+        expect(page.get_by_text(f"{n}개 추가 등록 (총 {n}개)")).to_be_visible()
         print(f"✓ registered {n} sessions from the UI")
 
         page.get_by_role("button", name="전체 시작").click()
@@ -89,10 +93,33 @@ def main() -> int:
         page.get_by_role("button", name="전체 중지").click()
         st = wait(lambda s: s["summary"]["running"] == 0 and s["system"]["lab_process_count"] == 0,
                   msg="stop-all + cleanup")
-        expect(page.get_by_text("개 중지")).to_be_visible()
-        print(f"✓ stop-all: 0 running, {st['system']['lab_process_count']} Chromium processes remain")
+        expect(page.get_by_text("브라우저 프로세스 0개 확인")).to_be_visible()
+        with urllib.request.urlopen(f"{API}/api/processes") as r:
+            procs = json.load(r)
+        assert procs["count"] == 0, procs
+        print(f"✓ stop-all: 0 running, verified 0 browser processes (marker + {procs['tracked_pids']} tracked PIDs)")
         time.sleep(1.5)
         page.screenshot(path=str(shots / "dashboard-stopped.png"), full_page=True)
+
+        # Registering again must not silently accumulate: a choice dialog appears.
+        page.get_by_label("세션 수").fill("3")
+        page.get_by_role("button", name="세션 등록").click()
+        dialog = page.get_by_role("alertdialog")
+        expect(dialog).to_contain_text(f"이미 {n}개 세션이 등록되어 있습니다")
+        dialog.get_by_role("button", name=f"기존 {n}개 교체 → 3개").click()
+        wait(lambda s: s["summary"]["total"] == 3, msg="replace")
+        print(f"✓ re-register shows a choice; '교체' left exactly 3 sessions (not {n + 3})")
+        page.get_by_label("세션 수").fill("2")
+        page.get_by_role("button", name="세션 등록").click()
+        page.get_by_role("alertdialog").get_by_role("button", name="2개 추가 → 총 5개").click()
+        wait(lambda s: s["summary"]["total"] == 5, msg="add")
+        print("✓ '추가' explicitly accumulated to 5")
+        page.get_by_label("세션 수").fill("1")
+        page.get_by_role("button", name="세션 등록").click()
+        page.get_by_role("alertdialog").get_by_role("button", name="취소").click()
+        time.sleep(1)
+        assert state()["summary"]["total"] == 5
+        print("✓ '취소' registered nothing")
 
         page.get_by_role("button", name="전체 삭제").click()
         wait(lambda s: s["summary"]["total"] == 0, msg="delete-all")

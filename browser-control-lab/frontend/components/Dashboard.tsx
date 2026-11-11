@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { api, LabState, LogEntry, Scenario, Session, SessionStatus } from "@/lib/api";
+import { api, LabState, LogEntry, PressureLevel, Scenario, Session, SessionStatus } from "@/lib/api";
 import { Connection, useLabState } from "@/lib/useLabState";
 
 const SCENARIOS: { value: Scenario; label: string }[] = [
@@ -98,6 +98,7 @@ export default function Dashboard() {
       ) : (
         <>
           <Stats state={state} />
+          <MemoryPanel state={state} />
           <Controls state={state} busy={busy} run={run} />
           <SessionTable sessions={state.sessions} busy={busy} run={run} />
           <Logs logs={state.logs} sessions={state.sessions} />
@@ -178,11 +179,129 @@ function Stats({ state }: { state: LabState }) {
       <Stat label="Chromium 프로세스" value={system.lab_process_count} sub="이 랩이 띄운 프로세스 수" />
       <Meter label="CPU" percent={system.cpu_percent} threshold={s.cpu_threshold} detail={`${system.cpu_count} 코어 · 3초 평균`} />
       <Meter
-        label="RAM"
-        percent={system.ram_percent}
+        label="시스템 RAM"
+        percent={system.memory.used_percent}
         threshold={s.ram_threshold}
-        detail={`${system.ram_used_gb} / ${system.ram_total_gb} GB`}
+        detail={`${system.memory.used_gb} / ${system.memory.total_gb} GB · psutil ${system.memory.psutil_percent}%`}
       />
+    </section>
+  );
+}
+
+const PRESSURE_STYLE: Record<PressureLevel, [string, string]> = {
+  normal: ["정상", "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/50 dark:text-emerald-200"],
+  warn: ["경고", "bg-amber-100 text-amber-800 dark:bg-amber-900/50 dark:text-amber-200"],
+  critical: ["위험", "bg-rose-100 text-rose-800 dark:bg-rose-900/50 dark:text-rose-200"],
+  unknown: ["측정 불가", "bg-slate-200 text-slate-700 dark:bg-slate-800 dark:text-slate-300"],
+};
+
+const BREAKDOWN: Record<string, [string, string]> = {
+  used: ["사용", "bg-sky-500"],
+  app: ["앱", "bg-sky-500"],
+  wired: ["와이어드", "bg-violet-500"],
+  compressed: ["압축", "bg-amber-500"],
+  cached: ["캐시된 파일", "bg-slate-300 dark:bg-slate-600"],
+  free: ["여유", "bg-slate-100 dark:bg-slate-800"],
+};
+
+function fmtGb(v: number) {
+  return `${v.toFixed(v < 10 ? 2 : 1)} GB`;
+}
+
+function MemoryPanel({ state }: { state: LabState }) {
+  const m = state.system.memory;
+  const lab = state.system.lab_memory;
+  const [plabel, pstyle] = PRESSURE_STYLE[m.pressure.level] ?? PRESSURE_STYLE.unknown;
+  const parts = Object.entries(m.breakdown_gb).filter(([k]) => k in BREAKDOWN);
+  const partsTotal = Math.max(m.total_gb, parts.reduce((a, [, v]) => a + v, 0));
+  const otherGb = Math.max(0, m.used_gb - lab.uss_mb / 1024);
+  const isMac = m.method.startsWith("vm_stat");
+  return (
+    <section className="mb-6 grid gap-3 lg:grid-cols-3">
+      <Card>
+        <div className="flex items-baseline justify-between">
+          <h3 className="text-xs font-medium text-slate-500 dark:text-slate-400">시스템 메모리 구성</h3>
+          <span className="text-xs text-slate-500 dark:text-slate-400" title={m.method}>
+            {isMac ? "Activity Monitor 방식" : "total − available"}
+          </span>
+        </div>
+        <div className="mt-2 flex h-3 overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800" aria-label="메모리 구성 막대">
+          {parts.map(([k, v]) => (
+            <div key={k} className={BREAKDOWN[k][1]} style={{ width: `${(100 * v) / partsTotal}%` }} title={`${BREAKDOWN[k][0]} ${fmtGb(v)}`} />
+          ))}
+        </div>
+        <ul className="mt-2 grid grid-cols-2 gap-x-3 gap-y-0.5 text-xs">
+          {parts.map(([k, v]) => (
+            <li key={k} className="flex items-center justify-between gap-2">
+              <span className="flex items-center gap-1.5">
+                <i className={`inline-block h-2 w-2 rounded-sm ${BREAKDOWN[k][1]}`} />
+                {BREAKDOWN[k][0]}
+              </span>
+              <span className="tabular-nums text-slate-600 dark:text-slate-300">{fmtGb(v)}</span>
+            </li>
+          ))}
+        </ul>
+        <p className="mt-2 text-[11px] leading-snug text-slate-500 dark:text-slate-400">
+          사용 = {isMac ? "앱 + 와이어드 + 압축" : "전체 − 사용 가능"} = <b>{fmtGb(m.used_gb)}</b> ({m.used_percent}%). psutil 값 {m.psutil_percent}%는
+          {isMac ? " 캐시 일부를 사용으로 계산해 더 높게 나옵니다." : " 비교용입니다."} 차단 기준은 사용 %입니다.
+        </p>
+      </Card>
+
+      <Card>
+        <div className="flex items-baseline justify-between">
+          <h3 className="text-xs font-medium text-slate-500 dark:text-slate-400">테스트 브라우저 메모리</h3>
+          <span className="text-xs text-slate-500 dark:text-slate-400">{state.system.lab_process_count}개 프로세스</span>
+        </div>
+        <div className="mt-1 text-3xl font-semibold tabular-nums">
+          {lab.uss_mb >= 1024 ? `${(lab.uss_mb / 1024).toFixed(2)} GB` : `${Math.round(lab.uss_mb)} MB`}
+          <span className="ml-2 text-sm font-normal text-slate-500">전체 RAM의 {lab.percent_of_total}%</span>
+        </div>
+        <dl className="mt-2 grid grid-cols-2 gap-x-3 gap-y-0.5 text-xs">
+          <dt className="text-slate-500">USS 합계 (종료 시 회수)</dt>
+          <dd className="text-right tabular-nums">{Math.round(lab.uss_mb)} MB</dd>
+          <dt className="text-slate-500" title="공유 라이브러리를 프로세스마다 중복 계산">RSS 합계 (공유 포함·과대)</dt>
+          <dd className="text-right tabular-nums">{Math.round(lab.rss_mb)} MB</dd>
+          <dt className="text-slate-500">나머지 시스템 사용</dt>
+          <dd className="text-right tabular-nums">{fmtGb(otherGb)}</dd>
+          <dt className="text-slate-500">백엔드 서버 RSS</dt>
+          <dd className="text-right tabular-nums">{lab.backend_rss_mb ?? "—"} MB</dd>
+        </dl>
+        {lab.method && lab.method !== "uss" && (
+          <p className="mt-2 text-[11px] text-amber-700 dark:text-amber-400">
+            일부 프로세스의 USS를 읽지 못해 RSS로 대체했습니다({lab.method}). 이 경우 값이 실제보다 큽니다.
+          </p>
+        )}
+      </Card>
+
+      <Card>
+        <div className="flex items-baseline justify-between">
+          <h3 className="text-xs font-medium text-slate-500 dark:text-slate-400">메모리 압력 · Swap</h3>
+          <span className="text-xs text-slate-500 dark:text-slate-400">
+            차단 기준: {state.summary.pressure_block_level === "off" ? "사용 안 함" : `'${state.summary.pressure_block_level}' 이상`}
+          </span>
+        </div>
+        <div className="mt-2 flex items-center gap-2">
+          <span className={`rounded-full px-3 py-1 text-sm font-semibold ${pstyle}`}>{plabel}</span>
+          <span className="text-[11px] text-slate-500" title={m.pressure.source}>
+            {m.pressure.source === "kern.memorystatus_vm_pressure_level" ? "macOS 메모리 압력" : m.pressure.source === "/proc/pressure/memory" ? `Linux PSI ${m.pressure.value ?? 0}%` : m.pressure.source}
+          </span>
+        </div>
+        <dl className="mt-3 grid grid-cols-2 gap-x-3 gap-y-0.5 text-xs">
+          <dt className="text-slate-500">Swap 사용</dt>
+          <dd className="text-right tabular-nums">
+            {m.swap.total_gb ? `${fmtGb(m.swap.used_gb)} / ${fmtGb(m.swap.total_gb)}` : "Swap 없음"}
+          </dd>
+          <dt className="text-slate-500">Swap in / out</dt>
+          <dd className={`text-right tabular-nums ${m.swap.out_mb_s > 1 ? "text-amber-600 dark:text-amber-400" : ""}`}>
+            {m.swap.in_mb_s} / {m.swap.out_mb_s} MB/s
+          </dd>
+          <dt className="text-slate-500">압축 메모리</dt>
+          <dd className="text-right tabular-nums">{m.breakdown_gb.compressed != null ? fmtGb(m.breakdown_gb.compressed) : "—"}</dd>
+        </dl>
+        <p className="mt-2 text-[11px] leading-snug text-slate-500 dark:text-slate-400">
+          압력이 &lsquo;경고&rsquo;로 바뀌거나 Swap out이 계속 늘면 세션 수를 줄이세요.
+        </p>
+      </Card>
     </section>
   );
 }
@@ -190,10 +309,21 @@ function Stats({ state }: { state: LabState }) {
 type Runner = (label: string, fn: () => Promise<unknown>, okText?: (r: any) => string) => Promise<void>;
 
 function Controls({ state, busy, run }: { state: LabState; busy: string | null; run: Runner }) {
-  const [count, setCount] = useState(10);
+  const [count, setCount] = useState(6);
   const [scenario, setScenario] = useState<Scenario>("basic");
-  const remaining = state.summary.max_sessions - state.summary.total;
+  const [confirming, setConfirming] = useState(false);
+  const existing = state.summary.total;
+  const running = state.summary.running + state.summary.starting;
+  const remaining = state.summary.max_sessions - existing;
   const anyActive = state.sessions.some((s) => ["starting", "running", "stopping"].includes(s.status));
+  const limit = state.summary.max_concurrent;
+
+  const register = (replace: boolean) =>
+    run(
+      "create",
+      () => api("/api/sessions", { method: "POST", body: JSON.stringify({ count, scenario, replace }) }),
+      (r) => (replace ? `기존 ${existing}개를 삭제하고 ${r.length}개로 교체했습니다` : `${r.length}개 추가 등록 (총 ${existing + r.length}개)`),
+    ).then(() => setConfirming(false));
 
   return (
     <Card className="mb-6">
@@ -203,9 +333,12 @@ function Controls({ state, busy, run }: { state: LabState; busy: string | null; 
           <input
             type="number"
             min={1}
-            max={Math.max(1, remaining)}
+            max={100}
             value={count}
-            onChange={(e) => setCount(Math.max(1, Math.min(100, Number(e.target.value) || 1)))}
+            onChange={(e) => {
+              setCount(Math.max(1, Math.min(100, Number(e.target.value) || 1)));
+              setConfirming(false);
+            }}
             className="w-24 rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
           />
         </label>
@@ -223,12 +356,7 @@ function Controls({ state, busy, run }: { state: LabState; busy: string | null; 
             ))}
           </select>
         </label>
-        <Btn
-          disabled={!!busy || remaining < 1}
-          onClick={() =>
-            run("create", () => api("/api/sessions", { method: "POST", body: JSON.stringify({ count, scenario }) }), (r) => `${r.length}개 세션 등록`)
-          }
-        >
+        <Btn disabled={!!busy || confirming} onClick={() => (existing === 0 ? register(false) : setConfirming(true))}>
           세션 등록
         </Btn>
         <div className="mx-1 hidden h-8 w-px bg-slate-200 sm:block dark:bg-slate-800" />
@@ -250,7 +378,9 @@ function Controls({ state, busy, run }: { state: LabState; busy: string | null; 
           disabled={!!busy || !anyActive}
           onClick={() =>
             run("stop-all", () => api("/api/sessions/stop-all", { method: "POST" }), (r) =>
-              `${r.stopped.length}개 중지 · 남은 프로세스 강제종료 ${r.leftover_processes_killed}개`,
+              r.verified_clean
+                ? `${r.stopped.length}개 중지 · 브라우저 프로세스 0개 확인`
+                : `${r.stopped.length}개 중지 · 경고: 프로세스 ${r.remaining_processes}개가 남아 있습니다`,
             )
           }
         >
@@ -266,16 +396,50 @@ function Controls({ state, busy, run }: { state: LabState; busy: string | null; 
         >
           전체 삭제
         </Btn>
-        <div className="ml-auto text-xs text-slate-500 dark:text-slate-400">
+        <div className="ml-auto text-right text-xs text-slate-500 dark:text-slate-400">
+          <div>
+            현재 등록 <b className="text-slate-900 dark:text-slate-100">{existing}</b>개 · 실행 {running}개 · 동시 실행 한도 {limit}
+          </div>
           {state.summary.admission_blocked_reason ? (
-            <span className="font-medium text-amber-700 dark:text-amber-400">
-              신규 실행 차단: {state.summary.admission_blocked_reason}
-            </span>
+            <div className="font-medium text-amber-700 dark:text-amber-400">신규 실행 차단: {state.summary.admission_blocked_reason}</div>
           ) : (
-            <span>신규 실행 가능 · 등록 여유 {remaining}</span>
+            <div>신규 실행 가능</div>
           )}
         </div>
       </div>
+
+      {confirming && (
+        <div
+          role="alertdialog"
+          aria-label="세션 등록 방식 선택"
+          className="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-100"
+        >
+          <p className="font-medium">
+            이미 {existing}개 세션이 등록되어 있습니다{running ? ` (실행 중 ${running}개)` : ""}. {count}개를 어떻게 등록할까요?
+          </p>
+          <ul className="mt-1 list-disc pl-5 text-xs">
+            <li>
+              <b>교체</b>: 기존 세션을 모두 중지·삭제하고 정확히 {count}개만 남깁니다.
+            </li>
+            <li>
+              <b>추가</b>: 기존 {existing}개에 더해 총 {existing + count}개가 됩니다.
+              {existing + count > limit && ` 동시 실행 한도(${limit})를 넘으므로 '전체 시작' 시 ${limit}개까지만 실행됩니다.`}
+              {existing + count > state.summary.max_sessions && ` 최대 등록 수(${state.summary.max_sessions})를 넘어 등록할 수 없습니다.`}
+            </li>
+          </ul>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <Btn variant="primary" disabled={!!busy} onClick={() => register(true)}>
+              기존 {existing}개 교체 → {count}개
+            </Btn>
+            <Btn disabled={!!busy || count > remaining} onClick={() => register(false)}>
+              {count}개 추가 → 총 {existing + count}개
+            </Btn>
+            <Btn disabled={!!busy} onClick={() => setConfirming(false)}>
+              취소
+            </Btn>
+          </div>
+        </div>
+      )}
     </Card>
   );
 }
@@ -357,7 +521,7 @@ function SessionTable({ sessions, busy, run }: { sessions: Session[]; busy: stri
                 <th className="px-2 py-2 text-right font-medium">평균 로딩</th>
                 <th className="px-2 py-2 text-right font-medium">TTFB</th>
                 <th className="px-2 py-2 text-center font-medium">격리</th>
-                <th className="px-2 py-2 text-right font-medium">메모리</th>
+                <th className="px-2 py-2 text-right font-medium" title="USS: 세션 종료 시 회수되는 메모리">메모리(USS)</th>
                 <th className="px-2 py-2 text-right font-medium">오류</th>
                 <th className="px-4 py-2 text-right font-medium">제어</th>
               </tr>
@@ -385,7 +549,10 @@ function SessionTable({ sessions, busy, run }: { sessions: Session[]; busy: stri
                     <td className="px-2 py-2 text-center">
                       {s.isolation_ok == null ? "—" : s.isolation_ok ? <span className="text-emerald-600" title="localStorage·쿠키 격리 확인">✓</span> : <span className="text-rose-600">✗</span>}
                     </td>
-                    <td className="px-2 py-2 text-right tabular-nums">
+                    <td
+                      className="px-2 py-2 text-right tabular-nums"
+                      title={s.memory_rss_mb != null ? `USS ${s.memory_mb} MB · RSS ${s.memory_rss_mb} MB (${s.memory_method})` : undefined}
+                    >
                       {s.memory_mb == null ? "—" : `${Math.round(s.memory_mb)} MB`}
                       {s.process_count > 0 && <div className="text-[11px] text-slate-500">{s.process_count} proc</div>}
                     </td>
