@@ -75,9 +75,37 @@ cd frontend && npm run dev
 ## 사용법
 
 1. **세션 등록**: 세션 수와 시나리오를 고른 뒤 `세션 등록`을 누릅니다. 최대 100개까지 등록됩니다.
+   이미 등록된 세션이 있으면 바로 등록하지 않고 선택 창을 띄웁니다.
+   - **교체**: 기존 세션을 중지·삭제하고 정확히 N개만 남깁니다.
+   - **추가**: 기존 세션에 더해 총 개수가 늘어납니다. 동시 실행 한도를 넘으면 미리 경고합니다.
+   - **취소**
+
+   API에서는 `POST /api/sessions` 본문에 `"replace": true`를 넣으면 교체가 됩니다.
 2. **전체 시작 / 전체 중지 / 전체 삭제**: 상단 버튼으로 일괄 제어합니다.
 3. **개별 제어**: 표의 각 행에서 `시작`, `중지`, `재시작`, `✕`(삭제)를 누릅니다. 다른 세션에는 영향이 없습니다.
-4. **모니터링**: 전체·실행 중·오류 세션 수, CPU/RAM(임계치 표시), Chromium 프로세스 수, 세션별 실행시간·반복 횟수·로딩 시간·TTFB·격리 확인·메모리·오류 수, 최근 로그가 WebSocket으로 1초마다 갱신됩니다. WebSocket이 끊기면 2초 간격 폴링으로 자동 전환합니다.
+4. **모니터링**: 아래 항목이 WebSocket으로 1초마다 갱신됩니다. WebSocket이 끊기면 2초 간격 폴링으로 자동 전환합니다.
+   - 전체·실행 중·오류 세션 수, CPU/RAM(임계치 표시), Chromium 프로세스 수
+   - 세션별 실행시간·반복 횟수·로딩 시간·TTFB·격리 확인·메모리(USS)·오류 수
+   - 최근 로그
+5. **메모리 패널** (아래 [메모리 측정](#메모리-측정) 참고)
+   - **시스템 메모리 구성**: macOS는 앱/와이어드/압축/캐시, Linux는 사용/캐시/여유
+   - **테스트 브라우저 메모리**: 브라우저 USS 합계, 전체 RAM 대비 %, RSS 합계(비교용), 나머지 시스템 사용량, 백엔드 서버 RSS
+   - **메모리 압력 · Swap**: 압력 등급, Swap 사용량, Swap in/out 속도, 압축 메모리
+
+## 메모리 측정
+
+| 표시 항목 | macOS | Linux | 의미 |
+|---|---|---|---|
+| 시스템 RAM 사용 % (차단 기준) | `vm_stat`: 앱(Anonymous−Purgeable) + 와이어드 + 압축 | total − available | Activity Monitor의 "사용된 메모리"와 같은 방식 |
+| psutil % (비교용) | (total − available)/total. available = free + inactive만 포함 | 위와 동일 | macOS에서는 캐시를 사용으로 일부 계산해 **더 높게** 나옴 |
+| 테스트 브라우저 USS | 세션 프로세스 트리의 USS 합 | 동일 | 세션을 끄면 회수되는 메모리. 실제 비용에 가장 가까움 |
+| 테스트 브라우저 RSS | 프로세스별 RSS 합 | 동일 | 공유 라이브러리를 프로세스마다 중복 계산. 실제보다 **2~8배 큼** |
+| 메모리 압력 | `sysctl kern.memorystatus_vm_pressure_level` (1 정상 / 2 경고 / 4 위험) | PSI `/proc/pressure/memory` (some avg10 ≥10% 경고, ≥40% 또는 full ≥5% 위험) | OS가 메모리 부족으로 느려지는지 |
+| Swap | `psutil.swap_memory()` (`vm.swapusage`) 사용량과 초당 in/out | 동일 | Swap out이 계속 늘면 RAM이 부족한 상태 |
+
+- 새 세션 실행은 RAM 사용 %가 `LAB_RAM_THRESHOLD` 이상이거나, 메모리 압력이 `LAB_PRESSURE_BLOCK_LEVEL`(기본 `warn`) 이상이면 차단됩니다.
+- 일부 프로세스의 USS를 읽지 못하면 RSS로 대체하고, 대시보드에 그 사실을 표시합니다(`memory_method`: `uss` / `uss+rss` / `rss`).
+- 참고: 리눅스 컨테이너에서 6세션은 USS 합계 679 MB, RSS 합계 5,307 MB였습니다. RSS를 그대로 더하면 메모리를 크게 과대평가합니다.
 
 ### 테스트 시나리오 (모두 localhost)
 
@@ -102,7 +130,9 @@ cd frontend && npm run dev
 
 - **세션 격리**: 세션마다 별도의 Chromium 프로세스(별도 프로필, 쿠키, 저장소)를 사용합니다.
 - **프로세스 추적**: 모든 Chromium에 `--blc-lab-marker=<서버PID>:<세션ID>` 인자를 붙입니다. 세션 중지 시 브라우저를 정상 종료한 다음, 같은 마커를 가진 프로세스와 그 자식 프로세스가 남아 있으면 강제 종료하고 0개인지 확인합니다.
-- **고아 프로세스 복구**: 서버가 시작할 때 마커의 서버 PID가 이미 죽은 Chromium을 찾아 종료합니다. 이전 실행에서 `running` 상태로 남은 세션은 `대기`로, 끝나지 않은 실행 이력은 `recovered_after_crash`로 정리합니다. 동시에 실행 중인 다른 랩 인스턴스의 브라우저는 건드리지 않습니다.
+- **PID 추적**: Chromium 보조 프로세스(렌더러, GPU, 네트워크)에는 마커가 없어서 브라우저 프로세스의 *자식*으로만 찾을 수 있습니다. 메인 프로세스가 먼저 죽으면 보조 프로세스는 부모를 잃고(macOS에서는 launchd로 재배치) 자식 검색에서 빠집니다. 이를 막기 위해 세션 실행 중 보이는 모든 PID를 시작 시각과 함께 메모리와 SQLite(`tracked_processes`)에 기록합니다. 정리할 때는 기록된 PID 중 시작 시각까지 같은 프로세스만 종료하므로, PID가 재사용된 다른 프로세스는 건드리지 않습니다.
+- **전체 중지 검증**: `전체 중지`는 세션을 멈춘 뒤 마커 검색과 추적 PID로 남은 프로세스를 다시 확인해 `verified_clean`과 `remaining_processes`를 돌려줍니다. 대시보드에 "브라우저 프로세스 0개 확인"이 표시되고, `GET /api/processes`로 언제든 확인할 수 있습니다.
+- **고아 프로세스 복구**: 서버가 시작할 때 마커의 서버 PID가 이미 죽은 Chromium을 찾아 종료합니다. 죽은 서버가 추적 PID로 남긴 프로세스도 함께 종료합니다. 이전 실행에서 `running` 상태로 남은 세션은 `대기`로, 끝나지 않은 실행 이력은 `recovered_after_crash`로 정리합니다. 동시에 실행 중인 다른 랩 인스턴스의 브라우저는 건드리지 않습니다.
 - **자원 가드**: 다음 중 하나에 해당하면 새 세션 실행을 거부합니다(HTTP 429, 대시보드에 사유 표시).
   - 실행 중 + 시작 중인 세션 수 ≥ `LAB_MAX_CONCURRENT`
   - CPU(3초 이동평균) ≥ `LAB_CPU_THRESHOLD`
@@ -123,7 +153,8 @@ cd frontend && npm run dev
 | `LAB_MAX_SESSIONS` | `100` | 등록 가능한 최대 세션 수(상한 100) |
 | `LAB_MAX_CONCURRENT` | 자동 | 동시 실행 한도. 기본값은 `min(25, RAM(MB)/300, 코어수×3)` |
 | `LAB_CPU_THRESHOLD` | `85` | 이 CPU%를 넘으면 신규 실행 차단 |
-| `LAB_RAM_THRESHOLD` | `85` | 이 RAM%를 넘으면 신규 실행 차단 |
+| `LAB_RAM_THRESHOLD` | `85` | 이 RAM 사용%(위 표의 OS 기준 값)를 넘으면 신규 실행 차단 |
+| `LAB_PRESSURE_BLOCK_LEVEL` | `warn` | 메모리 압력이 이 등급 이상이면 신규 실행 차단 (`warn` / `critical` / `off`) |
 | `LAB_ITERATION_INTERVAL` | `3` | 세션 반복 간격(초) |
 | `LAB_PAGE_TIMEOUT_MS` | `15000` | 페이지 로딩 타임아웃 |
 | `LAB_HEADLESS` | `1` | `0`이면 브라우저 창 표시 |
@@ -151,16 +182,21 @@ cd backend && .venv/bin/pytest -q
 backend/.venv/bin/python scripts/e2e_dashboard.py --sessions 10
 ```
 
-단계별 성능 테스트 (결과는 `reports/perf-*.md|json`):
+단계별 성능 테스트 (세션이 0개인 상태에서 실행):
 
 ```bash
-backend/.venv/bin/python scripts/perf_test.py --hold 30 --max 25
+backend/.venv/bin/python scripts/perf_test.py --stages 1,3,6,10 --hold 30
 ```
 
-`perf_test.py`는 1 → 5 → 10 단계를 실행합니다. 25 단계는 두 조건을 모두 만족할 때만 진행합니다.
-
-- 10 단계에서 측정한 CPU/RAM을 25개로 선형 추정했을 때 75% 미만이고, 오류가 0건
-- 25가 `LAB_MAX_CONCURRENT` 이하
+- **실행 순서**: 유휴 기준선(세션 0개)을 먼저 측정합니다. 이어 단계마다 세션 N개로 교체 → 시작 → `--hold`초 동안 1초 간격 측정 → 전체 중지 → `/api/processes`로 남은 프로세스 0개 확인 순서로 진행합니다.
+- **기록 항목**: CPU 평균·최대, RAM 사용%(OS 기준)와 psutil%, 테스트 브라우저 USS·RSS 합계와 세션당 값, 프로세스 수, 최악 메모리 압력, Swap 증가량, 로딩 시간, 오류, 중지 시간, 잔여 프로세스
+- **용량 추정**: 세션 1개당 RAM·CPU 증가량을 선형 근사해 임계치 기준 최대 세션 수를 추정합니다.
+- **자동 중단**: 10개를 넘는 단계, 그리고 직전 단계에서 메모리 압력이 경고 이상이었던 경우에는 아래 조건을 모두 만족해야 다음 단계로 갑니다.
+  - 추정 CPU·RAM이 한도 미만
+  - 메모리 압력 정상
+  - Swap 증가량 0.25 GB 이하
+  - 오류 0건
+- **결과 파일**: `reports/perf-<시각>.md`, `.html`(그래프), `.csv`, `.json`(초 단위 시계열 포함)
 
 ### pytest 테스트 항목
 
@@ -185,9 +221,12 @@ backend/.venv/bin/python scripts/perf_test.py --hold 30 --max 25
 | POST | `/api/sessions/start-all` · `/stop-all` | 일괄 제어 |
 | GET | `/api/logs?level=&session_id=` | 로그 조회 |
 | GET | `/api/runs` | 실행 이력(시작·종료·사유·반복·오류·평균 로딩) |
+| GET | `/api/processes` | 이 서버가 띄운 브라우저 프로세스 목록과 메모리 (마커 검색 + 추적 PID) |
 
 ## 알려진 제한
 
-- 개발과 검증은 Linux 컨테이너(4코어, 16GB)에서 했습니다. 코드는 macOS 전용 API를 쓰지 않으며 psutil과 Playwright 모두 macOS를 지원하지만, **실제 Mac에서는 아직 실행해 보지 않았습니다.**
-- 세션 메모리는 프로세스별 USS(고유 메모리) 합계입니다. macOS에서 권한 문제로 USS를 읽지 못하면 RSS로 대신하며, 이 경우 공유 메모리가 포함되어 값이 더 크게 보입니다.
+- 개발과 자동 테스트는 Linux 컨테이너(4코어, 16GB)에서 했습니다. macOS 6세션 실행은 사용자가 확인했습니다.
+- macOS 메모리 경로(`vm_stat` 파싱, `sysctl` 압력)는 `vm_stat` 형식의 샘플 출력으로 단위 테스트했으며, 실제 Mac에서는 아직 검증하지 않았습니다.
+- 세션 메모리는 USS 합계입니다. macOS에서 USS를 읽지 못하면 RSS로 대체하고 화면에 표시합니다.
+- Activity Monitor의 프로세스별 "메모리"(phys_footprint)는 psutil로 읽을 수 없어, USS와 약간 다를 수 있습니다.
 - 이 프로젝트는 로컬 전용입니다. 외부 서버 배포 설정은 포함하지 않았습니다.
