@@ -1,7 +1,20 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { api, CustomMode, LabConfig, LabState, LogEntry, PressureLevel, Scenario, Session, SessionStatus, VideoState } from "@/lib/api";
+import {
+  api,
+  CustomConfig,
+  CustomMode,
+  LabConfig,
+  LabState,
+  LogEntry,
+  PressureLevel,
+  ProbeResult,
+  Scenario,
+  Session,
+  SessionStatus,
+  VideoState,
+} from "@/lib/api";
 import { Connection, useLabState } from "@/lib/useLabState";
 
 const SCENARIOS: { value: Scenario; label: string }[] = [
@@ -313,7 +326,7 @@ function Controls({ state, busy, run }: { state: LabState; busy: string | null; 
   const [count, setCount] = useState(6);
   const [scenario, setScenario] = useState<Scenario>("basic");
   const [confirming, setConfirming] = useState(false);
-  const [custom, setCustom] = useState({ url: "", mode: "page_load" as CustomMode, reload_interval_s: 10, muted: true, loop: true });
+  const [custom, setCustom] = useCustomForm();
   const [config, setConfig] = useState<LabConfig | null>(null);
   useEffect(() => {
     api<LabConfig>("/api/config").then(setConfig).catch(() => setConfig(null));
@@ -335,7 +348,13 @@ function Controls({ state, busy, run }: { state: LabState; busy: string | null; 
           method: "POST",
           body: JSON.stringify({ count, scenario, replace, ...(isCustom ? { custom: { ...custom, url: custom.url.trim() } } : {}) }),
         }),
-      (r) => (replace ? `기존 ${existing}개를 삭제하고 ${r.length}개로 교체했습니다` : `${r.length}개 추가 등록 (총 ${existing + r.length}개)`),
+      (r) => {
+        const base = replace ? `기존 ${existing}개를 삭제하고 ${r.length}개로 교체했습니다` : `${r.length}개 추가 등록 (총 ${existing + r.length}개)`;
+        const c = r[0]?.custom;
+        if (!c) return base;
+        const opts = c.mode === "video" ? `Video Playback, ${c.muted ? "muted" : "소리 켬"}, ${c.loop ? "loop" : "1회"}` : `Page Load, ${c.reload_interval_s}s`;
+        return `${base} — URL: ${c.url} (${c.kind === "video_file" ? "직접 영상 파일" : "페이지"}, ${opts})`;
+      },
     ).then(() => setConfirming(false));
 
   return (
@@ -428,7 +447,7 @@ function Controls({ state, busy, run }: { state: LabState; busy: string | null; 
         </div>
       </div>
 
-      {isCustom && <CustomPanel custom={custom} setCustom={setCustom} config={config} urlLooksOk={urlLooksOk} />}
+      {isCustom && <CustomPanel custom={custom} setCustom={setCustom} config={config} urlLooksOk={urlLooksOk} sessions={state.sessions} />}
 
       {confirming && (
         <div
@@ -468,37 +487,128 @@ function Controls({ state, busy, run }: { state: LabState; busy: string | null; 
 
 type CustomForm = { url: string; mode: CustomMode; reload_interval_s: number; muted: boolean; loop: boolean };
 
+const CUSTOM_FORM_KEY = "blc-lab.custom-form.v1";
+const DEFAULT_FORM: CustomForm = { url: "", mode: "page_load", reload_interval_s: 10, muted: true, loop: true };
+
+/** Form state that survives reloads (per-browser convenience). Nothing ever writes to `url` except the user. */
+function useCustomForm(): [CustomForm, (f: CustomForm) => void] {
+  const [form, setForm] = useState<CustomForm>(DEFAULT_FORM);
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(CUSTOM_FORM_KEY);
+      if (raw) setForm({ ...DEFAULT_FORM, ...JSON.parse(raw) });
+    } catch {}
+  }, []);
+  const update = (f: CustomForm) => {
+    setForm(f);
+    try {
+      localStorage.setItem(CUSTOM_FORM_KEY, JSON.stringify(f));
+    } catch {}
+  };
+  return [form, update];
+}
+
+function sameConfig(form: CustomForm, c: CustomConfig) {
+  return (
+    form.url.trim() === c.url &&
+    form.mode === c.mode &&
+    (form.mode === "page_load" ? Number(form.reload_interval_s) === Number(c.reload_interval_s) : form.muted === c.muted && form.loop === c.loop)
+  );
+}
+
+/** Message when the form no longer matches what existing custom sessions were registered with. */
+function formChangeNotice(form: CustomForm, sessions: Session[]): string | null {
+  const regs = sessions.map((s) => s.custom).filter((c): c is CustomConfig => !!c);
+  if (!regs.length || !form.url.trim()) return null;
+  if (regs.some((c) => sameConfig(form, c))) return null;
+  if (!regs.some((c) => c.url === form.url.trim())) {
+    return "URL이 변경되었습니다. 기존 등록 세션에는 적용되지 않습니다. 새 설정을 적용하려면 세션을 다시 등록하세요.";
+  }
+  return "재생 설정이 변경되었습니다. 기존 등록 세션에는 적용되지 않습니다. 새 설정을 적용하려면 세션을 다시 등록하세요.";
+}
+
+function YesNo({ v }: { v: boolean | null | undefined }) {
+  if (v == null) return <span className="text-slate-400">—</span>;
+  return v ? <span className="text-emerald-700 dark:text-emerald-400">예</span> : <span className="text-slate-600 dark:text-slate-300">아니오</span>;
+}
+
+function ProbeView({ r }: { r: ProbeResult }) {
+  const v = r.video;
+  const rows: [string, React.ReactNode][] = [
+    ["입력 URL", <span key="i" className="break-all font-mono">{r.input_url}</span>],
+    ["최종 URL", r.final_url ? <span className="break-all font-mono">{r.final_url}</span> : "—"],
+    [
+      "허용 여부",
+      r.allowed ? <b className="text-emerald-700 dark:text-emerald-400">허용</b> : <b className="text-rose-700 dark:text-rose-400">차단</b>,
+    ],
+    ["차단 이유", r.blocked_reason ? <span className="text-rose-700 dark:text-rose-400">{r.blocked_reason}</span> : "—"],
+    ["HTTP status", r.http_status ?? "—"],
+    ["Content-Type", r.content_type ? <span className="font-mono">{r.content_type}</span> : "—"],
+    ["직접 영상 URL", <YesNo key="d" v={r.is_direct_video ?? (r.media_kind ? r.media_kind === "video_file" : null)} />],
+    ["HTML 페이지", <YesNo key="h" v={r.is_html} />],
+    ["HTML5 video 발견", <YesNo key="v" v={r.video_found} />],
+  ];
+  if (r.redirects && r.redirects.length) rows.splice(2, 0, ["리다이렉트", <span className="break-all font-mono">{r.redirects.join(" → ")}</span>]);
+  if (r.verification_required) rows.push(["소유권 확인", <YesNo key="o" v={r.verified} />]);
+  if (r.error) rows.push(["로드 오류", <span className="text-rose-700 dark:text-rose-400">{r.error}</span>]);
+  if (v)
+    rows.push([
+      "영상 정보",
+      <span key="vi" className="font-mono">
+        {fmtSec(v.duration)} · {v.ready_state_name} · {v.network_state_name}
+        {v.error ? ` · ${v.error.name}${v.hint ? ` (${v.hint})` : ""}` : ""}
+      </span>,
+    ]);
+  return (
+    <dl role="status" aria-label="URL 확인 결과" className="mt-2 grid grid-cols-[8rem_1fr] gap-x-3 gap-y-0.5 rounded-md bg-white p-2 text-xs dark:bg-slate-900">
+      {rows.map(([k, val]) => (
+        <div key={k} className="contents">
+          <dt className="text-slate-500">{k}</dt>
+          <dd>{val}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
 function CustomPanel({
   custom,
   setCustom,
   config,
   urlLooksOk,
+  sessions,
 }: {
   custom: CustomForm;
   setCustom: (c: CustomForm) => void;
   config: LabConfig | null;
   urlLooksOk: boolean;
+  sessions: Session[];
 }) {
-  const [check, setCheck] = useState<{ ok: boolean; text: string } | null>(null);
+  const [probe, setProbe] = useState<ProbeResult | null>(null);
+  const [probing, setProbing] = useState(false);
+  const [probeErr, setProbeErr] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const c = config?.custom;
-  const set = (patch: Partial<CustomForm>) => {
-    setCustom({ ...custom, ...patch });
-    setCheck(null);
-  };
-  const validate = async () => {
+  const set = (patch: Partial<CustomForm>) => setCustom({ ...custom, ...patch });
+  const check = async () => {
+    setProbing(true);
+    setProbeErr(null);
     try {
-      const r: any = await api("/api/custom/validate", { method: "POST", body: JSON.stringify({ url: custom.url.trim() }) });
-      setCheck({
-        ok: true,
-        text: r.local
-          ? `허용됨 (localhost): ${r.url}`
-          : `허용됨: ${r.host} → ${r.resolved_ips.join(", ")}${r.verification_required ? ` · 시작 시 소유권 확인: ${r.verify_url}` : ""}`,
-      });
+      setProbe(await api<ProbeResult>("/api/custom/probe", { method: "POST", body: JSON.stringify({ url: custom.url.trim() }) }));
     } catch (e) {
-      setCheck({ ok: false, text: (e as Error).message });
+      setProbe(null);
+      setProbeErr((e as Error).message);
+    } finally {
+      setProbing(false);
     }
   };
+  const probeStale = probe && probe.input_url !== custom.url.trim();
+  const notice = formChangeNotice(custom, sessions);
+  const registered = Array.from(
+    sessions
+      .filter((s) => s.custom)
+      .reduce((m, s) => m.set(s.custom!.url, (m.get(s.custom!.url) ?? 0) + 1), new Map<string, number>()),
+  );
   const input =
     "rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100";
   const lbl = "flex flex-col gap-1 text-xs font-medium text-slate-500 dark:text-slate-400";
@@ -507,11 +617,13 @@ function CustomPanel({
     <section aria-label="사용자 지정 URL 설정" className="mt-3 rounded-lg border border-sky-200 bg-sky-50/60 p-3 dark:border-sky-900 dark:bg-sky-950/30">
       <div className="flex flex-wrap items-end gap-3">
         <label className={`${lbl} min-w-[16rem] flex-1`}>
-          테스트 URL
+          테스트 URL (영상 파일 또는 영상이 있는 페이지)
           <input
             type="url"
             inputMode="url"
-            placeholder={`${apiBase}/lab/video`}
+            autoComplete="off"
+            spellCheck={false}
+            placeholder="https://test.my-site.com/clip.mp4"
             value={custom.url}
             onChange={(e) => set({ url: e.target.value })}
             className={`${input} font-mono`}
@@ -549,15 +661,32 @@ function CustomPanel({
             </label>
           </>
         )}
-        <Btn disabled={!urlLooksOk} onClick={validate}>
-          URL 확인
+        <Btn disabled={!urlLooksOk || probing} onClick={check} title="Chromium으로 URL을 한 번 열어 상태를 확인합니다 (입력값은 바뀌지 않습니다)">
+          {probing ? "확인 중…" : "URL 확인"}
         </Btn>
       </div>
       {!urlLooksOk && custom.url && <p className="mt-2 text-xs text-rose-700 dark:text-rose-400">http:// 또는 https:// 로 시작하는 URL을 입력하세요.</p>}
-      {check && (
-        <p role="status" className={`mt-2 break-all text-xs ${check.ok ? "text-emerald-700 dark:text-emerald-400" : "text-rose-700 dark:text-rose-400"}`}>
-          {check.text}
+      {probeErr && <p className="mt-2 text-xs text-rose-700 dark:text-rose-400">{probeErr}</p>}
+      {probe && (
+        <>
+          {probeStale && <p className="mt-2 text-xs text-amber-700 dark:text-amber-400">아래 결과는 이전에 확인한 URL에 대한 것입니다. 다시 확인하세요.</p>}
+          <ProbeView r={probe} />
+        </>
+      )}
+      {notice && (
+        <p role="alert" className="mt-2 rounded-md border border-amber-300 bg-amber-50 px-2 py-1.5 text-xs font-medium text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
+          {notice}
         </p>
+      )}
+      {registered.length > 0 && (
+        <div className="mt-2 text-xs text-slate-600 dark:text-slate-300">
+          <b>현재 등록된 custom URL</b>:{" "}
+          {registered.map(([u, n]) => (
+            <span key={u} className="mr-3 break-all font-mono">
+              {u} ×{n}
+            </span>
+          ))}
+        </div>
       )}
       <div className="mt-3 grid gap-3 text-xs leading-relaxed text-slate-600 sm:grid-cols-2 dark:text-slate-300">
         <div>
@@ -570,12 +699,12 @@ function CustomPanel({
             <span className="block text-amber-700 dark:text-amber-400">무시된 allowlist 항목: {c.config_problems.join(" / ")}</span>
           )}
           <span className="mt-1 block">
-            로컬 테스트 페이지:{" "}
+            로컬 예시 페이지(새 탭에서 열기, 입력창은 바뀌지 않음):{" "}
             {c &&
               Object.keys(c.local_test_pages).map((p) => (
-                <button key={p} type="button" className="mr-2 font-mono text-sky-700 underline dark:text-sky-400" onClick={() => set({ url: `${apiBase}${p}` })}>
+                <a key={p} href={`${apiBase}${p}`} target="_blank" rel="noreferrer" className="mr-2 font-mono text-sky-700 underline dark:text-sky-400">
                   {p}
-                </button>
+                </a>
               ))}
           </span>
         </div>
@@ -616,17 +745,30 @@ function fmtSec(v: number | null | undefined) {
 }
 
 function TargetCell({ s }: { s: Session }) {
-  const url = s.current_url ?? s.target_url;
+  const c = s.custom;
   const v = s.video;
+  const registered = c ? c.url : s.target_url;
+  const viaPlayer = c?.kind === "video_file" && c.mode === "video";
   return (
     <div className="space-y-0.5">
-      <div className="truncate font-mono text-[11px] text-slate-600 dark:text-slate-300" title={url}>
-        {url.replace(/^https?:\/\//, "")}
+      <div className="break-all font-mono text-[11px] text-slate-700 dark:text-slate-200" title={c ? "등록 URL (등록 시점 설정)" : "대상 URL"}>
+        {c && <span className="mr-1 font-sans text-slate-500">등록</span>}
+        {registered}
       </div>
+      {c && (
+        <div className="text-[11px] text-slate-500">
+          {c.kind === "video_file" ? "직접 영상 파일" : "페이지"}
+          {viaPlayer && " → 내부 플레이어"} ·{" "}
+          {c.mode === "video" ? `video · ${c.muted ? "muted" : "소리 켬"} · ${c.loop ? "loop" : "1회"}` : `reload ${c.reload_interval_s}s`}
+          {s.current_url && !viaPlayer && s.current_url !== (c.nav_url ?? c.url) && (
+            <span className="block break-all font-mono">현재 {s.current_url}</span>
+          )}
+        </div>
+      )}
       <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
         <span className={s.page_state === "error" ? "text-rose-600 dark:text-rose-400" : ""}>페이지 {PAGE_LABEL[s.page_state]}</span>
         <span className="text-slate-500">로드 {s.page_load_count}회</span>
-        {s.custom?.mode === "video" &&
+        {c?.mode === "video" &&
           (v && v.present ? (
             <>
               <span className={`rounded-full px-1.5 py-0.5 text-[11px] font-medium ${VIDEO_STYLE[v.state]}`}>{v.state}</span>
@@ -639,6 +781,12 @@ function TargetCell({ s }: { s: Session }) {
             <span className="text-slate-500">{v ? "영상 없음" : "영상 확인 전"}</span>
           ))}
       </div>
+      {c?.mode === "video" && v?.present && (
+        <div className="font-mono text-[10px] text-slate-500">
+          {v.ready_state_name ?? "—"} · {v.network_state_name ?? "—"}
+          {v.error && <span className="text-rose-600 dark:text-rose-400"> · {v.error.name}</span>}
+        </div>
+      )}
       {s.last_error && (
         <div className="truncate text-[11px] text-rose-600 dark:text-rose-400" title={s.last_error}>
           {s.last_error}

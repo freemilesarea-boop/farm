@@ -21,7 +21,9 @@ def test_allowlisted_domain_allowed_and_pinned():
     p = pol()
     t = p.validate("https://My-Site.example/watch?id=1#frag")
     assert t.host == "my-site.example" and not t.local and t.ips == ["93.184.216.34"]
-    assert t.url == "https://my-site.example/watch?id=1"           # fragment dropped, host normalised
+    assert t.url == "https://my-site.example/watch?id=1#frag"      # host normalised, rest kept as typed
+    assert t.input_url == "https://My-Site.example/watch?id=1#frag"  # original preserved for display
+    assert t.media_kind == "page"
     assert t.verify_url == "https://my-site.example/.well-known/blc-lab-verify.txt"
     rules = p.resolver_rules()
     assert "MAP my-site.example 93.184.216.34" in rules and "MAP cdn.my-site.example 93.184.216.35" in rules
@@ -115,3 +117,19 @@ def test_network_level_allowlist_args():
     assert bypass == ["localhost", "127.0.0.1", "[::1]", "my-site.example", "cdn.my-site.example"]
     # the dead proxy host itself must resolve to NOTFOUND (it is not mapped)
     assert "blc-lab-blocked.invalid" not in p.resolver_rules().split("MAP * ~NOTFOUND")[0]
+
+
+@pytest.mark.parametrize("url, kind", [
+    ("http://localhost:8000/media/clip.mp4", "video_file"), ("http://localhost/a/B.WEBM?x=1", "video_file"),
+    ("http://localhost/v.m4v#t=3", "video_file"), ("http://localhost/v.ogv", "video_file"),
+    ("http://localhost/watch?file=x.mp4", "page"), ("http://localhost/mp4/", "page"), ("http://localhost/", "page"),
+])
+def test_media_kind_detection(url, kind):
+    assert pol().validate(url).media_kind == kind
+
+
+def test_input_url_kept_verbatim():
+    raw = "HTTP://LOCALHOST:8000/Lab/Video?Q=Ab%20C#t=1.5"
+    t = pol().validate("  " + raw + "  ")
+    assert t.input_url == raw
+    assert t.url == "http://localhost:8000/Lab/Video?Q=Ab%20C#t=1.5"

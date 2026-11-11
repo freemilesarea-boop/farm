@@ -54,6 +54,22 @@ BLOCKED_PLATFORM_DOMAINS = frozenset({
 })
 
 
+# Direct video files Chromium can play in an HTML5 <video> (codec support permitting).
+VIDEO_FILE_EXTENSIONS = {".mp4": "video/mp4", ".m4v": "video/mp4", ".webm": "video/webm",
+                         ".ogv": "video/ogg", ".ogg": "video/ogg", ".mov": "video/quicktime"}
+
+
+def media_kind(path: str) -> str:
+    """'video_file' when the URL path ends in a known video extension, else 'page'."""
+    p = (path or "").lower().rsplit("/", 1)[-1]
+    return "video_file" if any(p.endswith(ext) for ext in VIDEO_FILE_EXTENSIONS) else "page"
+
+
+def is_video_content_type(ct: str | None) -> bool:
+    ct = (ct or "").split(";", 1)[0].strip().lower()
+    return ct.startswith("video/") or ct in ("application/ogg", "application/x-mpegurl")
+
+
 class CustomURLError(ValueError):
     """Raised with a user-facing message when a custom URL is not allowed."""
 
@@ -208,8 +224,11 @@ class CustomPolicy:
         netloc = f"[{host}]" if ":" in host else host
         if port:
             netloc += f":{port}"
-        normalized = urlunsplit((parts.scheme, netloc, parts.path or "/", parts.query, ""))
-        return ValidatedTarget(url=normalized, host=host, scheme=parts.scheme, port=port, local=local, ips=ips)
+        # Normalised form used for navigation (scheme/host lower-cased, IDNA). Path, query and
+        # fragment are kept exactly as typed; the original string is stored separately for display.
+        normalized = urlunsplit((parts.scheme, netloc, parts.path or "/", parts.query, parts.fragment))
+        return ValidatedTarget(url=normalized, host=host, scheme=parts.scheme, port=port, local=local, ips=ips,
+                               input_url=url, media_kind=media_kind(parts.path))
 
     # ------------------------------------------------------------------ browser-side checks
     def host_allowed(self, url: str, *, navigation: bool) -> bool:
@@ -267,12 +286,14 @@ class CustomPolicy:
 
 @dataclass(frozen=True)
 class ValidatedTarget:
-    url: str
+    url: str            # normalised URL used for navigation
     host: str
     scheme: str
     port: int | None
     local: bool
     ips: list[str]
+    input_url: str = ""  # exactly what the user entered (trimmed)
+    media_kind: str = "page"  # "video_file" when the path is a direct video file
 
     @property
     def origin(self) -> str:

@@ -99,13 +99,39 @@ cd frontend && npm run dev
 
 | 항목 | 설명 |
 |---|---|
-| 테스트 URL | `http://` 또는 `https://` URL만 입력할 수 있습니다. 예: `http://127.0.0.1:8000/lab/video` |
+| 테스트 URL | 영상 파일 URL(`.mp4` `.webm` `.m4v` `.ogv` `.ogg` `.mov`) 또는 영상이 있는 페이지 URL. `http://`/`https://`만 허용. **입력한 값은 그대로 유지됩니다**(자동 치환 없음, 새로고침해도 이 브라우저에 남음). |
 | 모드 | **Page Load**: URL을 열고, 지정한 간격마다 다시 로드합니다. **Video Playback**: 페이지 로드 후 첫 번째 HTML5 `<video>`를 찾아 재생합니다. |
 | 새로고침 간격(초) | Page Load 전용. 최소 `LAB_CUSTOM_MIN_RELOAD_S`(기본 2초) |
 | Muted / Loop | Video Playback 전용. Loop를 켜면 영상이 끝날 때마다 처음부터 다시 재생하고 반복 횟수를 셉니다. 끄면 한 번 재생 후 `ended` 상태로 유지됩니다. |
-| URL 확인 | 백엔드가 같은 규칙으로 URL을 검사해 결과를 보여줍니다. URL에 실제로 접속하지는 않습니다. |
+| URL 확인 | 백엔드가 URL을 검사한 뒤, 세션과 같은 네트워크 정책을 적용한 일회용 Chromium으로 **한 번 열어** 결과를 표시합니다(아래 참고). 입력값은 바뀌지 않습니다. |
 
 이후 세션 수를 정하고 **세션 등록 → 전체 시작 / 전체 중지** 순서로 기존과 똑같이 사용합니다.
+
+**등록 시점 고정**
+- 세션은 등록 당시의 URL과 재생 옵션을 자기 설정으로 저장합니다. 응답의 `custom.url`에는 입력한 그대로, `nav_url`에는 정규화된 값이 들어갑니다.
+- 이후 입력창을 바꿔도 기존 세션은 바뀌지 않습니다. 입력이 기존 세션 설정과 다르면 대시보드에 다음 안내가 표시됩니다: "URL이 변경되었습니다. 기존 등록 세션에는 적용되지 않습니다. 새 설정을 적용하려면 세션을 다시 등록하세요."
+- 등록 성공 메시지와 세션 표에 등록된 URL이 그대로 표시됩니다.
+
+### 직접 영상 파일 URL과 페이지 URL
+
+| 종류 | 판별 | 재생 방식 |
+|---|---|---|
+| 직접 영상 파일 | URL 경로가 영상 확장자로 끝남 | 랩이 내부 플레이어 페이지 `/lab/player?src=<URL>`를 만들고, `<video src>`에 그 URL을 넣어 재생합니다. 영상 요청 자체는 대상 호스트로 가므로 allowlist·SSRF 규칙이 그대로 적용됩니다. 플레이어도 `src`를 다시 검증하고, URL을 HTML이 아닌 JSON으로 넣어 스크립트 주입을 막습니다. |
+| 페이지 | 그 외 | 페이지를 열고 첫 번째 HTML5 `<video>`를 찾습니다. 리다이렉트 결과가 영상 파일이어도(Chromium이 띄우는 미디어 문서에 `<video>`가 있음) 동일하게 재생합니다. |
+
+### URL 확인 결과
+
+`POST /api/custom/probe`가 돌려주는 항목입니다.
+- 입력 URL, 최종 URL(리다이렉트 경로 포함), 허용 여부, 차단 이유
+- HTTP status, Content-Type
+- 직접 영상 URL 여부, HTML 페이지 여부, HTML5 video 발견 여부
+- 영상 정보: duration, readyState, networkState, 미디어 오류
+- 소유권 확인 결과(외부 도메인)
+
+동작 방식:
+- 확인용 브라우저는 세션과 같은 allowlist·DNS 고정·차단 프록시 정책으로 동작하고, 끝나면 바로 종료·정리됩니다.
+- 한 번에 하나만 실행되며, RAM 85% 또는 메모리 압력 `warn` 이상이면 실행하지 않습니다(HTTP 429).
+- 리다이렉트가 허용되지 않은 곳으로 향하면 그 목적지를 차단 이유에 표시합니다.
 
 세션 표의 **대상 · 페이지 / 영상** 칸에는 다음 정보가 표시됩니다.
 - 현재 URL
@@ -124,6 +150,10 @@ cd frontend && npm run dev
 | `/lab/redirect-local` | 같은 호스트로 302 (허용) |
 | `/lab/redirect-external` | 외부 호스트로 302 (차단되는지 확인) |
 | `/lab/redirect-ip` | 클라우드 메타데이터 IP(169.254.169.254)로 302 (차단되는지 확인) |
+| `/lab/static/test-2s.webm`, `test-2s-h264.mp4`, `test-2s-vp9.mp4` | 직접 영상 파일 (2초) |
+| `/lab/redirect-video` | 같은 호스트의 `test-2s.webm`으로 302 |
+
+대시보드의 예시 링크는 새 탭에서 열리기만 하며, 입력창 값을 바꾸지 않습니다.
 
 ### allowlist 설정 (`lab.env`)
 
@@ -162,7 +192,12 @@ LAB_CUSTOM_REQUIRE_VERIFICATION=1                               # 기본값. 외
 
 1. 페이지 로드 후 최대 10초 동안 `<video>`를 찾습니다. iframe 안의 영상은 대상이 아닙니다.
 2. Muted 설정을 적용하고 `play()`를 호출합니다. 브라우저는 `--autoplay-policy=no-user-gesture-required`로 실행되므로 Muted를 꺼도 재생할 수 있습니다.
-3. 1초마다 상태, currentTime/duration, 반복 횟수를 읽습니다.
+3. 1초마다 다음 값을 읽어 세션 표에 표시합니다.
+   - 상태(`playing`/`paused`/`ended`/`error`), paused, ended
+   - currentTime / duration
+   - `readyState`(HAVE_NOTHING~HAVE_ENOUGH_DATA), `networkState`(NETWORK_EMPTY/IDLE/LOADING/NO_SOURCE)
+   - 미디어 오류(MEDIA_ERR_*)
+   - 반복 횟수, `currentSrc`
 4. 다음 경우는 세션 오류로 기록합니다.
    - 영상이 없을 때
    - `play()`가 거부될 때
@@ -170,7 +205,10 @@ LAB_CUSTOM_REQUIRE_VERIFICATION=1                               # 기본값. 외
    - 페이지를 잃었을 때
 
    오류 후에는 간격만큼 기다렸다가 페이지를 다시 로드합니다. 재생이 시작되지 않은 채 연속 5번 실패하면 세션은 `오류`로 종료됩니다.
-5. Playwright의 Chromium은 H.264/AAC(독점 코덱)를 지원하지 않습니다. WebM(VP8/VP9/AV1)이나 Opus 영상으로 테스트하세요.
+5. 코덱: 현재 Playwright 번들 Chromium(빌드 153, Linux에서 확인)은 H.264/AAC MP4, VP9 MP4, WebM을 모두 재생합니다.
+   - 이전 버전 README의 "H.264 미지원" 안내는 잘못된 내용이어서 정정합니다.
+   - 재생할 수 없는 파일은 `MEDIA_ERR_SRC_NOT_SUPPORTED`와 원인 안내가 세션 오류로 기록됩니다.
+   - Mac용 빌드에서 MP4가 이 오류로 실패하면 WebM이나 VP9 MP4로 확인하세요.
 
 ### API
 
@@ -179,15 +217,20 @@ POST /api/sessions        {"count": 2, "scenario": "custom",
                            "custom": {"url": "http://127.0.0.1:8000/lab/video", "mode": "video",
                                       "reload_interval_s": 10, "muted": true, "loop": true}}
                           → 201, 또는 400 {"detail": "URL not allowed: ..."}
-POST /api/custom/validate {"url": "..."} → 200 {ok, url, host, local, resolved_ips, verification_required, verify_url} | 400
+POST /api/custom/validate {"url": "..."} → 200 {ok, url, host, local, resolved_ips, verification_required, verify_url} | 400   (빠른 검사, 접속 안 함)
+POST /api/custom/probe    {"url": "..."} → 200 {input_url, final_url, redirects, allowed, blocked_reason, http_status, content_type,
+                                                is_direct_video, is_html, video_found, video{duration, ready_state_name, ...}} | 429
+GET  /lab/player?src=<URL> → 직접 영상 파일용 내부 플레이어 (src 재검증, 허용되지 않으면 400)
 GET  /api/config          → custom: {allowed_hosts, resource_hosts, verification: {path, token}, local_test_pages, ...}
 ```
 
 세션 응답에는 다음 필드가 추가됩니다.
 
 ```
-custom, current_url, page_state, page_load_count,
-video: {present, state, current_time, duration, repeats, muted, loop}
+custom: {url(입력 그대로), nav_url, kind(page|video_file), mode, reload_interval_s, muted, loop, registered_at},
+current_url, page_state, page_load_count,
+video: {present, state, paused, ended, current_time, duration, ready_state(_name), network_state(_name),
+        error{code,name,message}, current_src, video_count, repeats, muted, loop}
 ```
 
 ## 메모리 측정

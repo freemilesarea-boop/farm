@@ -237,3 +237,124 @@ def test_guards_block_custom_sessions(server, monkeypatch):
                                                                   pressure={"level": "warn"}))
     r = server.post(f"/api/sessions/{sid}/start")
     assert r.status_code == 429 and "pressure 'warn'" in r.json()["detail"]
+
+
+# ================================================================ v2: input preservation, direct video files, probe
+def test_input_url_preserved_verbatim(server):
+    raw = f"HTTP://LOCALHOST:{PORT}/lab/video?Clip=A%20B#t=0.5"
+    s = create(server, raw, mode="video").json()[0]
+    assert s["custom"]["url"] == raw                                   # exactly as typed
+    assert s["custom"]["nav_url"] == f"http://localhost:{PORT}/lab/video?Clip=A%20B#t=0.5"
+    assert s["custom"]["kind"] == "page" and s["custom"]["mode"] == "video"
+    assert "lab/video" in s["target_url"] and "/lab/player" not in s["target_url"]
+
+
+def test_direct_webm_file_plays_in_internal_player(server):
+    url = f"{LOCAL}/lab/static/test-2s.webm"
+    sid = start_one(server, url, mode="video", muted=True, loop=True)
+    st = _wait(server, lambda st: (_by_id(st, sid)["video"] or {}).get("repeats", 0) >= 1, timeout=40)
+    s = _by_id(st, sid)
+    assert s["custom"]["kind"] == "video_file" and s["custom"]["url"] == url
+    assert "/lab/player?src=" in s["current_url"]                      # internal wrapper page
+    v = s["video"]
+    assert v["current_src"] == url and v["state"] in ("playing", "ended") and 1.5 < v["duration"] < 2.5
+    assert v["ready_state_name"] in ("HAVE_FUTURE_DATA", "HAVE_ENOUGH_DATA", "HAVE_CURRENT_DATA", "HAVE_METADATA")
+    assert v["network_state_name"] in ("NETWORK_IDLE", "NETWORK_LOADING") and v["error"] is None
+    assert v["muted"] is True and v["paused"] is False or v["ended"] is True
+
+
+def test_direct_mp4_h264_file(server):
+    """H.264/AAC MP4 plays in the bundled Chromium build used here (verified: build 153)."""
+    sid = start_one(server, f"{LOCAL}/lab/static/test-2s-h264.mp4", mode="video", muted=False, loop=True)
+    st = _wait(server, lambda st: (_by_id(st, sid)["video"] or {}).get("repeats", 0) >= 1, timeout=40)
+    v = _by_id(st, sid)["video"]
+    assert v["error"] is None and v["muted"] is False and abs(v["duration"] - 2.0) < 0.2
+
+
+def test_unplayable_file_records_media_error(server):
+    sid = start_one(server, f"{LOCAL}/lab/static/broken.mp4", mode="video")
+    st = _wait(server, lambda st: _by_id(st, sid)["errors"] >= 1, timeout=30)
+    s = _by_id(st, sid)
+    assert "Video playback failed to start" in s["last_error"] or "media error" in s["last_error"]
+    assert "코덱" in s["last_error"]                                     # actionable hint
+    assert s["video"]["state"] == "error"
+
+
+def test_redirect_to_allowed_video_plays(server):
+    sid = start_one(server, f"{LOCAL}/lab/redirect-video", mode="video", loop=True)
+    st = _wait(server, lambda st: (_by_id(st, sid)["video"] or {}).get("state") in ("playing", "ended"), timeout=30)
+    assert _by_id(st, sid)["current_url"].endswith("/lab/static/test-2s.webm")
+
+
+def test_registered_config_not_changed_by_later_registration(server):
+    a = create(server, f"{LOCAL}/lab/video", mode="video", muted=True, loop=False).json()[0]
+    b = create(server, f"{LOCAL}/lab/static/test-2s.webm", mode="video", muted=False, loop=True).json()[0]
+    sessions = {s["id"]: s for s in server.get("/api/sessions").json()}
+    assert sessions[a["id"]]["custom"]["url"] == f"{LOCAL}/lab/video"
+    assert sessions[a["id"]]["custom"]["loop"] is False and sessions[a["id"]]["custom"]["muted"] is True
+    assert sessions[b["id"]]["custom"]["url"].endswith("test-2s.webm")
+    # restart keeps the original snapshot
+    server.post(f"/api/sessions/{a['id']}/start")
+    st = _wait(server, lambda st: (_by_id(st, a["id"])["video"] or {}).get("state") in ("playing", "ended"))
+    assert _by_id(st, a["id"])["custom"]["url"] == f"{LOCAL}/lab/video"
+    assert _by_id(st, a["id"])["video"]["loop"] is False
+
+
+@pytest.mark.parametrize("path, expect", [
+    ("/lab/video", dict(allowed=True, is_html=True, is_direct_video=False, video_found=True, http_status=200)),
+    ("/lab/static/test-2s.webm", dict(allowed=True, is_html=False, is_direct_video=True, video_found=True,
+                                       content_type="video/webm", media_kind="video_file")),
+    ("/lab/static/test-2s-h264.mp4", dict(allowed=True, is_direct_video=True, content_type="video/mp4")),
+    ("/lab/basic", dict(allowed=True, is_html=True, video_found=False)),
+    ("/lab/redirect-video", dict(allowed=True, is_direct_video=True)),
+    ("/lab/redirect-external", dict(allowed=False)),
+    ("/lab/redirect-ip", dict(allowed=False)),
+])
+def test_probe_reports(server, path, expect):
+    r = server.post("/api/custom/probe", json={"url": f"{LOCAL}{path}"}).json()
+    assert r["input_url"] == f"{LOCAL}{path}"
+    for k, v in expect.items():
+        assert r[k] == v if k != "content_type" else r[k].startswith(v), (k, r)
+    if r["allowed"]:
+        assert r["final_url"] and r["blocked_reason"] is None
+        if r["video_found"]:
+            assert r["video"]["duration"] and r["video"]["ready_state_name"]
+    else:
+        assert "차단" in r["blocked_reason"]
+    if path == "/lab/redirect-video":
+        assert r["final_url"].endswith("/lab/static/test-2s.webm") and r["redirects"]
+    assert find_lab_processes(f"{os.getpid()}:probe") == []
+
+
+@pytest.mark.parametrize("url, needle", [("https://www.youtube.com/watch?v=1", "third-party"),
+                                         ("file:///etc/passwd", "Only http and https"),
+                                         ("https://not-allowed.example/v.mp4", "allowlist")])
+def test_probe_blocked_urls(server, url, needle):
+    r = server.post("/api/custom/probe", json={"url": url}).json()
+    assert r["allowed"] is False and needle in r["blocked_reason"] and r["input_url"] == url
+
+
+def test_probe_respects_resource_guard(server, monkeypatch):
+    from app.main import manager
+    monkeypatch.setattr(manager.monitor.memory, "pressure", {"level": "warn"})
+    monkeypatch.setattr(manager.monitor, "refresh_memory", lambda: None)
+    r = server.post("/api/custom/probe", json={"url": f"{LOCAL}/lab/video"})
+    assert r.status_code == 429 and "pressure" in r.json()["detail"]
+
+
+def test_player_page_validates_and_escapes(server):
+    assert server.get("/lab/player", params={"src": "https://evil.example/x.mp4"}).status_code == 400
+    assert server.get("/lab/player", params={"src": "file:///etc/passwd"}).status_code == 400
+    evil = f"{LOCAL}/x.mp4?a=</script><script>alert(1)</script>"
+    r = server.get("/lab/player", params={"src": evil.replace(" ", "")})
+    assert r.status_code == 200 and "<script>alert(1)" not in r.text and "\\u003c/script" in r.text
+
+
+def test_stop_all_after_direct_video_and_probe(server):
+    start_one(server, f"{LOCAL}/lab/static/test-2s.webm", mode="video")
+    start_one(server, f"{LOCAL}/lab/static/test-2s-h264.mp4", mode="video")
+    server.post("/api/custom/probe", json={"url": f"{LOCAL}/lab/video"})
+    _wait(server, lambda st: st["summary"]["running"] == 2)
+    out = server.post("/api/sessions/stop-all").json()
+    assert out["verified_clean"] and out["remaining_processes"] == 0
+    assert server.get("/api/processes").json()["count"] == 0 and find_lab_processes(str(os.getpid())) == []

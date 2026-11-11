@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from typing import Literal
 
@@ -53,8 +54,10 @@ def _validated_custom(body: CreateSessions) -> dict | None:
     except CustomURLError as exc:
         raise HTTPException(status_code=400, detail=f"URL not allowed: {exc}")
     interval = max(settings.custom_min_reload_s, body.custom.reload_interval_s)
-    return {"url": target.url, "mode": body.custom.mode, "reload_interval_s": interval,
-            "muted": body.custom.muted, "loop": body.custom.loop}
+    # Snapshot of the form at registration time. Later edits in the UI never change it.
+    return {"url": target.input_url, "nav_url": target.url, "kind": target.media_kind,
+            "mode": body.custom.mode, "reload_interval_s": interval,
+            "muted": body.custom.muted, "loop": body.custom.loop, "registered_at": time.time()}
 
 
 db = Database(settings.db_path)
@@ -106,6 +109,18 @@ async def get_config():
             "local_test_pages": LOCAL_EXTRA_PAGES,
         },
     }
+
+
+@app.post("/api/custom/probe")
+async def probe_custom_url(body: ValidateURL):
+    """"URL 확인": validate, then open the URL once in a short-lived Chromium under the same
+    network policy and report final URL, status, content type and HTML5 video details."""
+    try:
+        return await manager.probe(body.url)
+    except CustomURLError as exc:
+        return {"input_url": body.url.strip(), "allowed": False, "blocked_reason": str(exc)}
+    except LimitError as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
 
 
 @app.post("/api/custom/validate")

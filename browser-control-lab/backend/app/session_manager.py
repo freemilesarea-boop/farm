@@ -58,22 +58,53 @@ VIDEO_INSTALL_JS = """(opts) => {
       b.repeats++;
       if (b.loop) { v.currentTime = 0; v.play().catch(e => b.errors.push('replay failed: ' + e.name + ': ' + e.message)); }
     });
-    v.addEventListener('error', () => b.errors.push('media error ' + (v.error ? v.error.code + ' ' + (v.error.message || '') : '')));
+    v.addEventListener('error', () => b.errors.push(
+      'media error ' + (v.error ? v.error.code + ' (' + ['', 'ABORTED', 'NETWORK', 'DECODE', 'SRC_NOT_SUPPORTED'][v.error.code] + ') ' + (v.error.message || '') : '')));
   }
   window.__blc.loop = !!opts.loop;
+  v.loop = false;  // repeats are driven by the 'ended' handler so they can be counted
   v.muted = !!opts.muted;
   return v.play().then(() => ({present: true, started: true}))
-                 .catch(e => ({present: true, started: false, error: e.name + ': ' + e.message}));
+                 .catch(e => ({present: true, started: false,
+                               error: e.name + ': ' + e.message + (v.error ? ' (media error ' + v.error.code + ')' : '')}));
 }"""
 VIDEO_STATUS_JS = """() => {
   const v = document.querySelector('video');
   if (!v) return {present: false};
   const b = window.__blc;
   const state = v.error ? 'error' : v.ended ? 'ended' : (!v.paused ? 'playing' : 'paused');
-  return {present: true, installed: !!b, state, current_time: v.currentTime,
-          duration: isFinite(v.duration) ? v.duration : null, repeats: b ? b.repeats : 0,
-          errors: b ? b.errors.splice(0) : [], muted: v.muted};
+  return {present: true, installed: !!b, state, paused: v.paused, ended: v.ended,
+          current_time: v.currentTime, duration: isFinite(v.duration) ? v.duration : null,
+          ready_state: v.readyState, network_state: v.networkState,
+          error: v.error ? {code: v.error.code, message: v.error.message || ''} : null,
+          current_src: v.currentSrc || v.src || null, video_count: document.querySelectorAll('video').length,
+          repeats: b ? b.repeats : 0, errors: b ? b.errors.splice(0) : [], muted: v.muted};
 }"""
+READY_STATES = ["HAVE_NOTHING", "HAVE_METADATA", "HAVE_CURRENT_DATA", "HAVE_FUTURE_DATA", "HAVE_ENOUGH_DATA"]
+NETWORK_STATES = ["NETWORK_EMPTY", "NETWORK_IDLE", "NETWORK_LOADING", "NETWORK_NO_SOURCE"]
+MEDIA_ERRORS = {1: "MEDIA_ERR_ABORTED", 2: "MEDIA_ERR_NETWORK", 3: "MEDIA_ERR_DECODE", 4: "MEDIA_ERR_SRC_NOT_SUPPORTED"}
+CODEC_HINT = (" — 이 브라우저가 해당 코덱/컨테이너를 재생하지 못합니다. WebM(VP9/AV1) 또는 MP4(H.264/VP9/AV1)로 "
+              "인코딩된 파일인지 확인하세요.")
+
+
+def video_view(st: dict, loop: bool) -> dict:
+    """Shape the in-page status for the API/dashboard (named readyState/networkState/error)."""
+    if not st.get("present"):
+        return {"present": False, "state": "none"}
+    err = st.get("error")
+    rs, ns = st.get("ready_state"), st.get("network_state")
+    return {
+        "present": True, "state": st["state"], "paused": st.get("paused"), "ended": st.get("ended"),
+        "current_time": round(st["current_time"], 2) if st.get("current_time") is not None else None,
+        "duration": round(st["duration"], 2) if st.get("duration") else None,
+        "ready_state": rs, "ready_state_name": READY_STATES[rs] if isinstance(rs, int) and 0 <= rs < 5 else None,
+        "network_state": ns,
+        "network_state_name": NETWORK_STATES[ns] if isinstance(ns, int) and 0 <= ns < 4 else None,
+        "error": ({"code": err["code"], "name": MEDIA_ERRORS.get(err["code"]), "message": err.get("message")}
+                  if err else None),
+        "current_src": st.get("current_src"), "video_count": st.get("video_count"),
+        "repeats": st.get("repeats", 0), "muted": st.get("muted"), "loop": loop,
+    }
 
 
 class LimitError(RuntimeError):
@@ -125,8 +156,13 @@ class TestSession:
 
     @property
     def target_url(self) -> str:
+        """URL the browser navigates to. Direct video files are wrapped in the lab's player page."""
         if self.custom:
-            return self.custom["url"]
+            nav = self.custom.get("nav_url") or self.custom["url"]
+            if self.custom.get("kind") == "video_file" and self.custom["mode"] == "video":
+                from urllib.parse import quote
+                return f"http://127.0.0.1:{settings.port}/lab/player?src={quote(nav, safe='')}"
+            return nav
         return f"http://127.0.0.1:{settings.port}{SCENARIOS[self.scenario]['path']}"
 
     @property
@@ -224,6 +260,7 @@ class SessionManager:
         self._sampler: asyncio.Task | None = None
         self._lock = asyncio.Lock()  # guards admission decisions
         self._verified_origins: dict[str, float] = {}
+        self._probe_sem = asyncio.Semaphore(1)
 
     # ------------------------------------------------------------------ lifecycle
     async def startup(self) -> None:
@@ -586,7 +623,11 @@ class SessionManager:
 
     @staticmethod
     def _browser_args(s: TestSession) -> list[str]:
-        if not s.custom:
+        return SessionManager._browser_args_for(s.custom)
+
+    @staticmethod
+    def _browser_args_for(custom: dict | None) -> list[str]:
+        if not custom:
             return list(LOCAL_ONLY_BROWSER_ARGS)
         # Same lockdown, but allow-listed hosts are pinned to their validated IPs.
         pol = settings.custom_policy
@@ -594,7 +635,7 @@ class SessionManager:
         args = [a if not a.startswith("--host-resolver-rules=") else f"--host-resolver-rules={rules}"
                 for a in LOCAL_ONLY_BROWSER_ARGS if a != "--no-proxy-server"]
         args += pol.proxy_args()
-        if s.custom["mode"] == "video":
+        if custom["mode"] == "video":
             args.append("--autoplay-policy=no-user-gesture-required")
         return args
 
@@ -696,9 +737,22 @@ class SessionManager:
         tgt = s.target
         if tgt is None or tgt.local or not settings.custom_policy.require_verification:
             return True
+        why = await self._ownership_problem(page, tgt)
+        if why:
+            s.page_state = "error"
+            self._record_error(s, f"Ownership verification failed for {tgt.origin}: {why}. Serve the token shown "
+                                  f"in the dashboard at {tgt.verify_url} (or test on localhost).")
+            return False
+        self.db.log("info", f"Ownership verified for {tgt.origin}", session_id=s.id)
+        return True
+
+    async def _ownership_problem(self, page: Page, tgt: ValidatedTarget) -> str | None:
+        """None if ``tgt`` is local, verification is off, cached, or the token file checks out."""
+        if tgt.local or not settings.custom_policy.require_verification:
+            return None
         cached = self._verified_origins.get(tgt.origin)
         if cached and time.time() - cached < 3600:
-            return True
+            return None
         token = settings.verification_token
         why = None
         try:
@@ -711,14 +765,117 @@ class SessionManager:
                 why = "the file does not contain this lab's token"
         except Exception as exc:
             why = (str(exc).splitlines() or [type(exc).__name__])[0]
-        if why:
-            s.page_state = "error"
-            self._record_error(s, f"Ownership verification failed for {tgt.origin}: {why}. Serve the token shown "
-                                  f"in the dashboard at {tgt.verify_url} (or test on localhost).")
-            return False
-        self._verified_origins[tgt.origin] = time.time()
-        self.db.log("info", f"Ownership verified for {tgt.origin}", session_id=s.id)
-        return True
+        if why is None:
+            self._verified_origins[tgt.origin] = time.time()
+        return why
+
+    # ------------------------------------------------------------------ URL probe ("URL 확인")
+    async def probe(self, url: str) -> dict[str, Any]:
+        """Open ``url`` once in a short-lived Chromium under the custom-URL network policy and
+        report what is there. Policy errors raise CustomURLError; resource limits raise LimitError."""
+        pol = settings.custom_policy
+        tgt = pol.validate(url)
+        reason = self._resource_block_reason()
+        if reason:
+            raise LimitError(reason)
+        out: dict[str, Any] = {
+            "input_url": tgt.input_url, "normalized_url": tgt.url, "host": tgt.host, "local": tgt.local,
+            "resolved_ips": tgt.ips, "media_kind": tgt.media_kind, "allowed": True, "blocked_reason": None,
+            "verification_required": (not tgt.local) and pol.require_verification, "verified": None,
+            "final_url": None, "redirects": [], "http_status": None, "content_type": None,
+            "is_direct_video": False, "is_html": False, "video_found": None, "video": None,
+        }
+        probe_id = f"probe-{uuid.uuid4().hex[:8]}"
+        marker = f"{os.getpid()}:{probe_id}"
+        blocked: list[str] = []
+        browser = None
+        async with self._probe_sem:
+            try:
+                pw = await self._playwright()
+                fake = {"mode": "video"}
+                browser = await pw.chromium.launch(
+                    headless=settings.headless, executable_path=settings.chromium_executable,
+                    args=[f"{PROCESS_MARKER}={marker}", *self._browser_args_for(fake)])
+                context = await browser.new_context(viewport={"width": 1280, "height": 800})
+
+                async def guard(route):
+                    req = route.request
+                    try:
+                        nav = req.is_navigation_request() and req.frame.parent_frame is None
+                    except Exception:
+                        nav = False
+                    if pol.host_allowed(req.url, navigation=nav):
+                        await route.continue_()
+                    else:
+                        blocked.append(req.url[:300])
+                        await route.abort("blockedbyclient")
+                await context.route("**/*", guard)
+                context.on("requestfailed", lambda req: blocked.append(req.url[:300])
+                           if any(e in (req.failure or "") for e in self._NET_BLOCK_ERRORS)
+                           and not pol.host_allowed(req.url, navigation=False) else None)
+                page = await context.new_page()
+                page.set_default_timeout(settings.page_timeout_ms)
+
+                why = await self._ownership_problem(page, tgt)
+                if out["verification_required"]:
+                    out["verified"] = why is None
+                if why:
+                    out.update(allowed=False, blocked_reason=f"소유권 확인 실패: {why} ({tgt.verify_url})")
+                    return out
+                try:
+                    resp = await page.goto(tgt.url, wait_until="load")
+                except Exception as exc:
+                    msg = (str(exc).splitlines() or [type(exc).__name__])[0]
+                    if blocked:
+                        out.update(allowed=False, blocked_reason=f"허용되지 않은 호스트로의 요청/리다이렉트 차단: {blocked[0]}")
+                    else:
+                        out["blocked_reason"] = None
+                        out["error"] = msg
+                    return out
+                hops = []
+                req = resp.request if resp else None
+                while req is not None:
+                    hops.append(req.url)
+                    req = req.redirected_from
+                out["redirects"] = list(reversed(hops))[1:] if len(hops) > 1 else []
+                out["final_url"] = page.url
+                bad = [u for u in [page.url, *hops] if not pol.host_allowed(u, navigation=True)]
+                if bad:
+                    out.update(allowed=False, blocked_reason=f"리다이렉트 최종 목적지가 허용되지 않음: {bad[0]}")
+                    return out
+                out["http_status"] = resp.status if resp else None
+                ct = (resp.headers.get("content-type") if resp else None) or ""
+                out["content_type"] = ct or None
+                from .custom_target import is_video_content_type
+                out["is_direct_video"] = is_video_content_type(ct)
+                out["is_html"] = "html" in ct.lower()
+                if out["is_html"] or out["is_direct_video"]:
+                    # Chromium shows a direct video file in a "media document" that contains a <video>.
+                    try:
+                        await page.wait_for_selector("video", state="attached", timeout=3000)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(1.0)  # let metadata load
+                    st = await page.evaluate(VIDEO_STATUS_JS)
+                    out["video_found"] = bool(st.get("present"))
+                    out["video"] = video_view(st, False) if st.get("present") else None
+                    if out["video"] and out["video"]["error"] and out["video"]["error"]["code"] in (3, 4):
+                        out["video"]["hint"] = CODEC_HINT.strip(" —")
+                if blocked:
+                    out["blocked_subrequests"] = blocked[:10]
+                return out
+            finally:
+                if browser is not None:
+                    try:
+                        await asyncio.wait_for(browser.close(), timeout=5)
+                    except Exception:
+                        pass
+                await asyncio.to_thread(kill_lab_processes, marker)
+                left = await asyncio.to_thread(find_lab_processes, marker)
+                if left:
+                    self.db.log("error", f"URL probe left {len(left)} processes")
+                self.db.log("info", f"URL probe: {tgt.input_url[:200]} -> allowed={out['allowed']} "
+                                    f"status={out['http_status']} video={out['video_found']}")
 
     async def _video_cycle(self, s: TestSession, page: Page) -> None:
         """Load the page, start the first HTML5 <video>, then poll its state until stop or failure."""
@@ -737,8 +894,14 @@ class SessionManager:
             self._record_error(s, "No HTML5 <video> element found on the page")
             return
         if not res.get("started"):
-            s.video = {"present": True, "state": "error", "repeats": 0}
-            self._record_error(s, f"Video playback failed to start: {res.get('error')}")
+            try:
+                s.video = video_view(await page.evaluate(VIDEO_STATUS_JS), opts["loop"])
+            except Exception:
+                s.video = {"present": True, "state": "error", "repeats": 0}
+            s.video["state"] = "error"
+            err = res.get("error") or ""
+            hint = CODEC_HINT if ("NotSupported" in err or "error 4" in err) else ""
+            self._record_error(s, f"Video playback failed to start: {err}{hint}")
             return
         self.db.log("info", f"{s.name}: video playback started (muted={opts['muted']}, loop={opts['loop']})",
                     session_id=s.id)
@@ -753,11 +916,9 @@ class SessionManager:
             if not st.get("present") or not st.get("installed"):
                 self._record_error(s, "Video element disappeared or the page navigated away")
                 return
-            s.video = {"present": True, "state": st["state"], "current_time": round(st["current_time"], 2),
-                       "duration": round(st["duration"], 2) if st.get("duration") else None,
-                       "repeats": st["repeats"], "muted": st["muted"], "loop": opts["loop"]}
+            s.video = video_view(st, opts["loop"])
             for err in st.get("errors", []):
-                self._record_error(s, f"Video: {err}")
+                self._record_error(s, f"Video: {err}{CODEC_HINT if 'SRC_NOT_SUPPORTED' in err or 'DECODE' in err else ''}")
             if st["state"] == "error":
                 return
             if st["state"] == "playing":

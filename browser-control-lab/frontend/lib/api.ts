@@ -7,7 +7,12 @@ export type Scenario = "basic" | "heavy" | "slow" | "flaky" | "error" | "custom"
 export type CustomMode = "page_load" | "video";
 
 export interface CustomConfig {
+  /** exactly what the user typed (snapshot at registration) */
   url: string;
+  /** normalised URL the browser navigates to */
+  nav_url?: string;
+  kind?: "page" | "video_file";
+  registered_at?: number;
   mode: CustomMode;
   reload_interval_s: number;
   muted: boolean;
@@ -19,11 +24,44 @@ export type VideoState = "playing" | "paused" | "ended" | "error" | "none";
 export interface VideoStatus {
   present: boolean;
   state: VideoState;
-  current_time?: number;
+  paused?: boolean;
+  ended?: boolean;
+  current_time?: number | null;
   duration?: number | null;
+  ready_state?: number;
+  ready_state_name?: string | null;
+  network_state?: number;
+  network_state_name?: string | null;
+  error?: { code: number; name: string | null; message: string | null } | null;
+  current_src?: string | null;
+  video_count?: number;
   repeats?: number;
   muted?: boolean;
   loop?: boolean;
+  hint?: string;
+}
+
+export interface ProbeResult {
+  input_url: string;
+  allowed: boolean;
+  blocked_reason: string | null;
+  normalized_url?: string;
+  host?: string;
+  local?: boolean;
+  resolved_ips?: string[];
+  media_kind?: "page" | "video_file" | null;
+  verification_required?: boolean;
+  verified?: boolean | null;
+  final_url?: string | null;
+  redirects?: string[];
+  http_status?: number | null;
+  content_type?: string | null;
+  is_direct_video?: boolean | null;
+  is_html?: boolean | null;
+  video_found?: boolean | null;
+  video?: VideoStatus | null;
+  blocked_subrequests?: string[];
+  error?: string;
 }
 
 export interface LabConfig {

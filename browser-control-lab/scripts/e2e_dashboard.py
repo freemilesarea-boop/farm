@@ -137,20 +137,60 @@ def main() -> int:
         assert state()["summary"]["total"] == 0
         print("✓ custom: YouTube URL refused by the backend, error shown, nothing registered")
 
-        url_box.fill(f"{API}/lab/video")
+        # The URL the user types is never rewritten: not by "URL 확인", registration or reload.
+        typed = f"{API}/lab/video?From=E2E#t=0.1"
+        url_box.fill(typed)
         page.get_by_label("모드").select_option("video")
         expect(page.get_by_label("Muted")).to_be_checked()
         page.get_by_role("button", name="URL 확인").click()
-        expect(page.get_by_text("허용됨 (localhost)")).to_be_visible()
+        result = page.get_by_label("URL 확인 결과")
+        expect(result).to_contain_text("허용")
+        expect(result).to_contain_text("text/html")
+        expect(result.get_by_text("HTML5 video 발견")).to_be_visible()
+        assert url_box.input_value() == typed, url_box.input_value()
+        print("✓ custom: URL 확인 shows status/content-type/video and leaves the input untouched")
+
         page.get_by_role("button", name="세션 등록").click()
         wait(lambda s: s["summary"]["total"] == 2, msg="custom register")
+        expect(page.get_by_text(f"URL: {typed}")).to_be_visible()
+        assert url_box.input_value() == typed
+        assert all(x["custom"]["url"] == typed for x in state()["sessions"])
+        print("✓ custom: registered with the exact typed URL; input unchanged")
+
+        page.reload()
+        expect(page.get_by_text("실시간 연결")).to_be_visible(timeout=15000)
+        page.get_by_label("테스트 시나리오").select_option("custom")
+        assert page.get_by_label("테스트 URL").input_value() == typed
+        print("✓ custom: input survives a page reload")
+        url_box = page.get_by_label("테스트 URL")
+        page.get_by_label("세션 수").fill("2")  # (session count is not persisted)
+
         page.get_by_role("button", name="전체 시작").click()
         st = wait(lambda s: all((x["video"] or {}).get("repeats", 0) >= 1 for x in s["sessions"]),
                   msg="custom video repeats", timeout=60)
-        expect(page.get_by_text("반복 1회").first.or_(page.get_by_text("반복 2회").first)).to_be_visible()
         v = st["sessions"][0]["video"]
         print(f"✓ custom video: 2 sessions playing, state={v['state']} t={v['current_time']}/{v['duration']}s "
-              f"repeats={v['repeats']}")
+              f"repeats={v['repeats']} {v['ready_state_name']}/{v['network_state_name']}")
+
+        # Editing the input must not touch registered sessions, and must say so.
+        direct = f"{API}/lab/static/test-2s.webm"
+        url_box.fill(direct)
+        expect(page.get_by_text("URL이 변경되었습니다. 기존 등록 세션에는 적용되지 않습니다. "
+                                "새 설정을 적용하려면 세션을 다시 등록하세요.")).to_be_visible()
+        assert all(x["custom"]["url"] == typed for x in state()["sessions"])
+        print("✓ custom: URL edit shows the 'not applied to existing sessions' notice; sessions keep their URL")
+
+        # Re-register (replace) with a direct video file -> internal player.
+        page.get_by_role("button", name="세션 등록").click()
+        page.get_by_role("alertdialog").get_by_role("button", name="기존 2개 교체 → 2개").click()
+        wait(lambda s: s["summary"]["total"] == 2 and all(x["custom"]["url"] == direct for x in s["sessions"]),
+             msg="replace with direct file")
+        expect(page.get_by_text("직접 영상 파일 → 내부 플레이어").first).to_be_visible()
+        page.get_by_role("button", name="전체 시작").click()
+        st = wait(lambda s: all((x["video"] or {}).get("repeats", 0) >= 1 for x in s["sessions"]),
+                  msg="direct file repeats", timeout=60)
+        assert st["sessions"][0]["video"]["current_src"] == direct
+        print("✓ custom: direct .webm URL plays via the internal player (current_src = typed URL)")
         time.sleep(1)
         page.screenshot(path=str(shots / "dashboard-custom-video.png"), full_page=True)
         page.get_by_role("button", name="전체 중지").click()

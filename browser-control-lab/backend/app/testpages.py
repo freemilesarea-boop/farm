@@ -28,6 +28,10 @@ LOCAL_EXTRA_PAGES = {
     "/lab/redirect-local": "302 -> /lab/basic (same host)",
     "/lab/redirect-external": "302 -> an external host (must be blocked)",
     "/lab/redirect-ip": "302 -> a cloud-metadata IP literal (must be blocked)",
+    "/lab/static/test-2s.webm": "Direct video file (WebM/VP9)",
+    "/lab/static/test-2s-h264.mp4": "Direct video file (MP4 H.264/AAC)",
+    "/lab/static/test-2s-vp9.mp4": "Direct video file (MP4 VP9)",
+    "/lab/redirect-video": "302 -> /lab/static/test-2s.webm (same host)",
 }
 
 
@@ -100,9 +104,44 @@ async def whoami(request: Request) -> JSONResponse:
     return JSONResponse({"lab_sid": request.cookies.get("lab_sid")})
 
 
-@router.get("/static/test-2s.webm")
-async def test_video() -> FileResponse:
-    return FileResponse(STATIC / "test-2s.webm", media_type="video/webm")
+_MEDIA = {"test-2s.webm": "video/webm", "test-2s-h264.mp4": "video/mp4", "test-2s-vp9.mp4": "video/mp4",
+          "broken.mp4": "video/mp4"}  # broken.mp4: random bytes, for playback-error tests
+
+
+@router.get("/static/{name}")
+async def test_media(name: str) -> Response:
+    if name not in _MEDIA:
+        return PlainTextResponse("not found", status_code=404)
+    return FileResponse(STATIC / name, media_type=_MEDIA[name])
+
+
+@router.get("/redirect-video")
+async def redirect_video() -> RedirectResponse:
+    return RedirectResponse("/lab/static/test-2s.webm", status_code=302)
+
+
+@router.get("/player", response_class=HTMLResponse)
+async def player(src: str = "") -> Response:
+    """Internal wrapper for *direct video file* URLs: a page whose only content is a
+    <video> pointing at ``src``. ``src`` must pass the same custom-URL policy as any
+    session target (checked again here, and the browser still enforces it per request).
+    The URL is injected as JSON (never as raw HTML), so it cannot break out of the page."""
+    import json
+
+    from .config import settings
+    from .custom_target import CustomURLError
+    try:
+        target = settings.custom_policy.validate(src, resolve=False)
+    except CustomURLError as exc:
+        return HTMLResponse(_page("Player: URL not allowed", f"<p id='err'>{html.escape(str(exc))}</p>"),
+                            status_code=400)
+    src_json = json.dumps(target.url).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    return HTMLResponse(f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Lab player</title>
+<style>body{{margin:0;background:#111;color:#ddd;font:13px system-ui}} video{{width:100%;max-height:90vh}}
+#src{{padding:6px 10px;word-break:break-all}}</style></head>
+<body><video id="v" controls playsinline preload="auto"></video><div id="src"></div>
+<script>const s={src_json};const v=document.getElementById('v');v.src=s;
+document.getElementById('src').textContent='Direct video: '+s;</script></body></html>""")
 
 
 @router.get("/video", response_class=HTMLResponse)
