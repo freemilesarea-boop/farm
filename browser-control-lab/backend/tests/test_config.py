@@ -84,3 +84,22 @@ def test_guards_still_block_with_limit_50(monkeypatch):
 
     mgr.monitor.memory = MemorySnapshot(total=16 * gb, used=int(8 * gb), pressure={"level": "critical"})
     assert "pressure 'critical'" in mgr.admission_check()          # critical -> blocked
+
+
+def test_suite_is_isolated_from_lab_env_and_shell():
+    """Even with lab.env at 100 (or LAB_MAX_CONCURRENT=100 in the shell), the suite runs at 10,
+    so no test can launch more than ~12 real browsers."""
+    import app.session_manager as sm
+    assert sm.settings.max_concurrent == 10
+    assert sm.settings.max_sessions == 100
+
+
+def test_repo_lab_env_value():
+    from pathlib import Path
+    values = {}
+    for line in (Path(config.PROJECT_DIR) / "lab.env").read_text().splitlines():
+        line = line.split("#", 1)[0].strip()
+        if "=" in line:
+            k, _, v = line.partition("=")
+            values[k.strip()] = v.strip()
+    assert values == {"LAB_MAX_CONCURRENT": "100"}  # only the concurrency limit is set there

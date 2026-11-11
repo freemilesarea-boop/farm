@@ -152,7 +152,7 @@ cd frontend && npm run dev
 | `LAB_ENV_FILE` | `<프로젝트>/lab.env` | 머신 설정 파일 경로 |
 | `LAB_PORT` | `8000` | 백엔드 포트 |
 | `LAB_MAX_SESSIONS` | `100` | 등록 가능한 최대 세션 수(상한 100) |
-| `LAB_MAX_CONCURRENT` | 자동 (`lab.env`: 50) | 동시 실행 한도. 지정하지 않으면 `min(25, RAM(MB)/300, 코어수×3)` |
+| `LAB_MAX_CONCURRENT` | 자동 (`lab.env`: 100) | 동시 실행 한도. 지정하지 않으면 `min(25, RAM(MB)/300, 코어수×3)` |
 | `LAB_CPU_THRESHOLD` | `85` | 이 CPU%를 넘으면 신규 실행 차단 |
 | `LAB_RAM_THRESHOLD` | `85` | 이 RAM 사용%(위 표의 OS 기준 값)를 넘으면 신규 실행 차단 |
 | `LAB_PRESSURE_BLOCK_LEVEL` | `warn` | 메모리 압력이 이 등급 이상이면 신규 실행 차단 (`warn` / `critical` / `off`) |
@@ -175,10 +175,10 @@ cd frontend && npm run dev
 현재 저장소의 `lab.env`는 전용 테스트 머신(Mac mini M4 / 16GB)용입니다.
 
 ```
-LAB_MAX_CONCURRENT=50
+LAB_MAX_CONCURRENT=100
 ```
 
-이 머신의 자동 계산값은 `min(25, RAM MB/300, 코어×3)` = 25입니다. 25개가 안정적으로 동작하는 것을 확인한 뒤 테스트 목적으로 50으로 올렸습니다. 이 값을 올려도 아래 보호 로직은 그대로 신규 실행을 차단합니다.
+이 머신의 자동 계산값은 `min(25, RAM MB/300, 코어×3)` = 25입니다. 25개, 50개가 정상 동작하는 것을 차례로 확인한 뒤 테스트 편의를 위해 100(최대 등록 수와 같음)으로 올렸습니다. 실제 실행 수는 보호 로직이 결정합니다. 이 값을 올려도 아래 보호 로직은 그대로 신규 실행을 차단합니다.
 - RAM 사용 85% 이상
 - 메모리 압력 `warn` 이상
 - CPU 85% 이상
