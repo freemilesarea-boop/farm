@@ -36,6 +36,13 @@ CREATE TABLE IF NOT EXISTS logs (
     message      TEXT NOT NULL,
     data         TEXT
 );
+CREATE TABLE IF NOT EXISTS tracked_processes (
+    pid          INTEGER NOT NULL,
+    create_time  REAL NOT NULL,
+    session_id   TEXT NOT NULL,
+    server_pid   INTEGER NOT NULL,
+    PRIMARY KEY (pid, create_time)
+);
 CREATE INDEX IF NOT EXISTS idx_logs_session ON logs(session_id, id);
 CREATE INDEX IF NOT EXISTS idx_runs_session ON runs(session_id, id);
 """
@@ -89,6 +96,26 @@ class Database:
             (time.time(),),
         )
         return cur.rowcount
+
+    # ---- tracked browser processes (for cleanup / crash recovery)
+    def track_processes(self, session_id: str, server_pid: int, pids) -> None:
+        with self._lock:
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO tracked_processes(pid, create_time, session_id, server_pid) VALUES (?,?,?,?)",
+                [(pid, ct, session_id, server_pid) for pid, ct in pids],
+            )
+
+    def untrack_session(self, session_id: str, server_pid: int) -> None:
+        self._exec("DELETE FROM tracked_processes WHERE session_id=? AND server_pid=?", (session_id, server_pid))
+
+    def tracked_by_server(self) -> dict[int, list[tuple[int, float]]]:
+        out: dict[int, list[tuple[int, float]]] = {}
+        for r in self._all("SELECT pid, create_time, server_pid FROM tracked_processes"):
+            out.setdefault(r["server_pid"], []).append((r["pid"], r["create_time"]))
+        return out
+
+    def untrack_server(self, server_pid: int) -> None:
+        self._exec("DELETE FROM tracked_processes WHERE server_pid=?", (server_pid,))
 
     # ---- runs
     def start_run(self, sid: str, started_at: float) -> int:

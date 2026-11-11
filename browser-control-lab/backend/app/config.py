@@ -46,6 +46,9 @@ class Settings:
     # New sessions are refused while the system is above these thresholds.
     cpu_threshold: float = _env_float("LAB_CPU_THRESHOLD", 85.0)
     ram_threshold: float = _env_float("LAB_RAM_THRESHOLD", 85.0)
+    # Refuse new browsers while OS memory pressure is at/above this level
+    # ("warn" or "critical"; "off" disables). macOS: kern.memorystatus_vm_pressure_level.
+    pressure_block_level: str = os.environ.get("LAB_PRESSURE_BLOCK_LEVEL", "warn").lower()
 
     # Seconds between test iterations inside one session.
     iteration_interval: float = _env_float("LAB_ITERATION_INTERVAL", 3.0)

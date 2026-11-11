@@ -22,6 +22,8 @@ class CreateSessions(BaseModel):
     count: int = Field(1, ge=1, le=100)
     scenario: Scenario = "basic"
     name_prefix: str | None = Field(None, max_length=40, pattern=r"^[A-Za-z0-9_\-]*$")
+    # True: stop and delete every existing session first, so the lab holds exactly `count`.
+    replace: bool = False
 
 
 db = Database(settings.db_path)
@@ -63,6 +65,7 @@ async def get_config():
         "max_concurrent": settings.max_concurrent,
         "cpu_threshold": settings.cpu_threshold,
         "ram_threshold": settings.ram_threshold,
+        "pressure_block_level": settings.pressure_block_level,
         "iteration_interval": settings.iteration_interval,
         "scenarios": SCENARIOS,
     }
@@ -80,6 +83,10 @@ async def list_sessions():
 
 @app.post("/api/sessions", status_code=201)
 async def create_sessions(body: CreateSessions):
+    if body.replace:
+        await manager.stop_all(reason="replace")
+        for sid in list(manager.sessions):
+            await manager.delete_session(sid)
     try:
         created = manager.create_sessions(body.count, body.scenario, body.name_prefix)
     except LimitError as exc:
@@ -137,6 +144,12 @@ async def start_all():
 @app.post("/api/sessions/stop-all")
 async def stop_all():
     return await manager.stop_all()
+
+
+@app.get("/api/processes")
+async def processes():
+    """All live browser processes owned by this server (marker search + tracked PIDs)."""
+    return await asyncio.to_thread(manager.process_report)
 
 
 @app.get("/api/logs")

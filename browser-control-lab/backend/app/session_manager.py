@@ -19,7 +19,9 @@ from playwright.async_api import Browser, BrowserContext, Page, Playwright, Rout
 
 from .config import PROCESS_MARKER, settings
 from .db import Database
-from .procs import find_lab_processes, kill_lab_processes, process_tree_memory_mb
+from .procs import (alive_tracked, describe, find_lab_processes, kill_lab_processes, kill_tracked,
+                    snapshot_pids)
+from .sysmem import PRESSURE_ORDER, MemoryReader, MemorySnapshot, process_memory
 from .security import assert_local_url, is_local_url, redact
 from .testpages import SCENARIOS
 
@@ -67,8 +69,11 @@ class TestSession:
     isolation_ok: bool | None = None
     blocked_requests: int = 0
     last_error: str | None = None
-    memory_mb: float | None = None
+    memory_mb: float | None = None        # USS sum of the session's process tree
+    memory_rss_mb: float | None = None    # RSS sum (overstates: shared pages counted per process)
+    memory_method: str | None = None
     process_count: int = 0
+    tracked: set = field(default_factory=set, repr=False)  # {(pid, create_time)} ever seen
     run_id: int | None = None
     crashed: bool = False
     # runtime handles (not serialised)
@@ -113,38 +118,52 @@ class TestSession:
             "blocked_requests": self.blocked_requests,
             "last_error": self.last_error,
             "memory_mb": self.memory_mb,
+            "memory_rss_mb": self.memory_rss_mb,
+            "memory_method": self.memory_method,
             "process_count": self.process_count,
         }
 
 
 class SystemMonitor:
-    """Samples CPU/RAM in the background so guards never block on psutil intervals."""
+    """Samples CPU / memory / pressure / swap in the background so guards never block."""
 
     def __init__(self) -> None:
         self.cpu_percent = 0.0
-        self.ram_percent = psutil.virtual_memory().percent
-        self.ram_used_gb = 0.0
-        self.ram_total_gb = psutil.virtual_memory().total / 1024**3
         self.cpu_count = psutil.cpu_count(logical=True) or 1
         # CPU is a moving average of the last 3 one-second samples, so a single
         # spike (e.g. one Chromium launching) does not flip the admission guard.
         self._cpu_samples: deque[float] = deque(maxlen=3)
         psutil.cpu_percent(interval=None)  # prime; first real sample comes 1 s later
+        self._mem_reader = MemoryReader()
+        self.memory: MemorySnapshot = self._mem_reader.read()
+
+    @property
+    def ram_percent(self) -> float:
+        """RAM figure used by the guard (Activity-Monitor style on macOS)."""
+        return self.memory.used_percent
+
+    @property
+    def pressure_level(self) -> str:
+        return self.memory.pressure.get("level", "unknown")
+
+    def refresh_memory(self) -> None:
+        self.memory = self._mem_reader.read()
 
     def sample(self) -> None:
         self._cpu_samples.append(psutil.cpu_percent(interval=None))
         self.cpu_percent = sum(self._cpu_samples) / len(self._cpu_samples)
-        vm = psutil.virtual_memory()
-        self.ram_percent = vm.percent
-        self.ram_used_gb = (vm.total - vm.available) / 1024**3
+        self.refresh_memory()
 
     def to_dict(self) -> dict[str, Any]:
+        m = self.memory
         return {
             "cpu_percent": round(self.cpu_percent, 1),
-            "ram_percent": round(self.ram_percent, 1),
-            "ram_used_gb": round(self.ram_used_gb, 2),
-            "ram_total_gb": round(self.ram_total_gb, 2),
             "cpu_count": self.cpu_count,
+            # kept for compatibility: the guard's RAM figure
+            "ram_percent": round(m.used_percent, 1),
+            "ram_used_gb": round(m.used / 1024**3, 2),
+            "ram_total_gb": round(m.total / 1024**3, 2),
+            "memory": m.to_dict(),
         }
 
 
@@ -166,6 +185,7 @@ class SessionManager:
         from .procs import kill_orphaned_lab_processes
 
         killed = kill_orphaned_lab_processes()
+        killed += self._reap_tracked_from_dead_servers()
         if recovered or killed:
             self.db.log("warning", "Recovered from unclean shutdown",
                         data={"sessions_reset": recovered, "orphan_processes_killed": killed})
@@ -193,6 +213,21 @@ class SessionManager:
         leftover = kill_lab_processes(str(os.getpid()))
         self.db.log("info", "Server stopped", data={"leftover_processes_killed": leftover})
 
+    def _reap_tracked_from_dead_servers(self) -> int:
+        killed = 0
+        for server_pid, pids in self.db.tracked_by_server().items():
+            if server_pid == os.getpid():
+                continue
+            try:
+                alive = psutil.pid_exists(server_pid) and psutil.Process(server_pid).status() != psutil.STATUS_ZOMBIE
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                alive = False
+            if alive:
+                continue  # another running lab instance owns these
+            killed += kill_tracked(pids)
+            self.db.untrack_server(server_pid)
+        return killed
+
     async def _playwright(self) -> Playwright:
         async with self._pw_lock:
             if self._pw is None:
@@ -207,14 +242,25 @@ class SessionManager:
                 self.monitor.sample()
                 for s in list(self.sessions.values()):
                     if s.status in ACTIVE_STATES:
-                        procs = await asyncio.to_thread(find_lab_processes, s.marker)
-                        s.process_count = len(procs)
-                        s.memory_mb = round(process_tree_memory_mb(procs), 1)
+                        await asyncio.to_thread(self._sample_session, s)
                     else:
                         s.process_count = 0
-                        s.memory_mb = None
+                        s.memory_mb = s.memory_rss_mb = s.memory_method = None
             except Exception as exc:  # never let the sampler die
                 self.db.log("error", f"Monitor sampling failed: {exc}")
+
+    def _sample_session(self, s: TestSession) -> None:
+        procs = find_lab_processes(s.marker)
+        new = snapshot_pids(procs) - s.tracked
+        if new and s.status in ACTIVE_STATES:
+            s.tracked |= new
+            self.db.track_processes(s.id, os.getpid(), new)
+        # include tracked processes that were re-parented away from the marked browser
+        seen = {p.pid for p in procs}
+        procs += [p for p in alive_tracked(s.tracked) if p.pid not in seen]
+        mem = process_memory(procs)
+        s.process_count = len(procs)
+        s.memory_mb, s.memory_rss_mb, s.memory_method = mem["uss_mb"], mem["rss_mb"], mem["method"]
 
     # ------------------------------------------------------------------ registry
     def create_sessions(self, count: int, scenario: str, name_prefix: str | None = None) -> list[TestSession]:
@@ -260,12 +306,19 @@ class SessionManager:
         """Return a reason string if a new browser may NOT be started right now."""
         if self.active_count() >= settings.max_concurrent:
             return f"concurrency limit reached ({settings.max_concurrent})"
-        # CPU comes from the 1 s background sampler; RAM is read fresh (cheap and instantaneous).
-        self.monitor.ram_percent = psutil.virtual_memory().percent
+        # CPU comes from the 1 s background sampler; memory is read fresh.
+        self.monitor.refresh_memory()
+        return self._resource_block_reason()
+
+    def _resource_block_reason(self) -> str | None:
         if self.monitor.cpu_percent >= settings.cpu_threshold:
             return f"CPU {self.monitor.cpu_percent:.0f}% >= threshold {settings.cpu_threshold:.0f}%"
         if self.monitor.ram_percent >= settings.ram_threshold:
             return f"RAM {self.monitor.ram_percent:.0f}% >= threshold {settings.ram_threshold:.0f}%"
+        block = PRESSURE_ORDER.get(settings.pressure_block_level)
+        level = self.monitor.pressure_level
+        if block is not None and block >= 0 and PRESSURE_ORDER.get(level, -1) >= block:
+            return f"memory pressure '{level}' (blocking at '{settings.pressure_block_level}')"
         return None
 
     # ------------------------------------------------------------------ control
@@ -349,9 +402,34 @@ class SessionManager:
         targets = [s.id for s in self.sessions.values() if s.status in ACTIVE_STATES]
         await asyncio.gather(*(self.stop(sid, reason=reason) for sid in targets), return_exceptions=True)
         leftover = await asyncio.to_thread(kill_lab_processes, str(os.getpid()))
-        self.db.log("info", f"Stop-all ({reason}): {len(targets)} session(s) stopped",
-                    data={"leftover_processes_killed": leftover})
-        return {"stopped": targets, "leftover_processes_killed": leftover}
+        leftover += await asyncio.to_thread(kill_tracked, self._all_tracked())
+        # Verify: nothing with our marker and no tracked PID may still be alive.
+        remaining = await asyncio.to_thread(self.lab_processes)
+        verified = not remaining
+        self.db.log("info" if verified else "error",
+                    f"Stop-all ({reason}): {len(targets)} session(s) stopped, "
+                    f"{'0 browser processes remain' if verified else f'{len(remaining)} processes REMAIN'}",
+                    data={"leftover_processes_killed": leftover, "remaining": len(remaining)})
+        return {"stopped": targets, "leftover_processes_killed": leftover,
+                "remaining_processes": len(remaining), "verified_clean": verified}
+
+    def _all_tracked(self) -> set:
+        out: set = set()
+        for s in self.sessions.values():
+            out |= s.tracked
+        return out
+
+    def lab_processes(self) -> list[psutil.Process]:
+        """Every live process belonging to this server: marker search + tracked PIDs."""
+        procs = find_lab_processes(str(os.getpid()))
+        seen = {p.pid for p in procs}
+        procs += [p for p in alive_tracked(self._all_tracked()) if p.pid not in seen]
+        return procs
+
+    def process_report(self) -> dict[str, Any]:
+        procs = self.lab_processes()
+        return {"count": len(procs), "memory": process_memory(procs), "processes": describe(procs),
+                "tracked_pids": len(self._all_tracked())}
 
     # ------------------------------------------------------------------ session worker
     @staticmethod
@@ -483,6 +561,9 @@ class SessionManager:
 
     async def _cleanup(self, s: TestSession, context: BrowserContext | None) -> None:
         s.stop_event.set()  # marks the coming disconnect as intentional
+        # Record the full process tree *before* closing: once the browser process exits,
+        # its helpers can no longer be found as descendants.
+        await asyncio.to_thread(self._sample_session, s)
         try:
             if context is not None:
                 await asyncio.wait_for(context.close(), timeout=5)
@@ -494,15 +575,22 @@ class SessionManager:
         except Exception:
             pass
         s.browser = None
-        # Belt and braces: make sure no process of this session survives.
+        # Belt and braces: kill anything with the marker, then any tracked PID still alive.
         killed = await asyncio.to_thread(kill_lab_processes, s.marker)
+        killed += await asyncio.to_thread(kill_tracked, s.tracked)
         remaining = await asyncio.to_thread(find_lab_processes, s.marker)
+        remaining += [p for p in await asyncio.to_thread(alive_tracked, s.tracked)
+                      if p.pid not in {r.pid for r in remaining}]
         s.process_count = len(remaining)
-        s.memory_mb = None
+        s.memory_mb = s.memory_rss_mb = s.memory_method = None
         if remaining:
-            self.db.log("error", f"Cleanup incomplete: {len(remaining)} process(es) remain", session_id=s.id)
+            self.db.log("error", f"Cleanup incomplete: {len(remaining)} process(es) remain",
+                        session_id=s.id, data={"pids": [p.pid for p in remaining]})
         else:
-            self.db.log("info", f"{s.name} cleaned up (forced kills: {killed})", session_id=s.id)
+            self.db.log("info", f"{s.name} cleaned up: {len(s.tracked)} tracked processes gone "
+                                f"(forced kills: {killed})", session_id=s.id)
+            s.tracked = set()
+            self.db.untrack_session(s.id, os.getpid())
 
     # ------------------------------------------------------------------ views
     def summary(self) -> dict[str, Any]:
@@ -518,6 +606,7 @@ class SessionManager:
             "max_concurrent": settings.max_concurrent,
             "cpu_threshold": settings.cpu_threshold,
             "ram_threshold": settings.ram_threshold,
+            "pressure_block_level": settings.pressure_block_level,
             "admission_blocked_reason": None,
         }
 
@@ -525,15 +614,35 @@ class SessionManager:
         summary = self.summary()
         if summary["running"] + summary["starting"] >= settings.max_concurrent:
             summary["admission_blocked_reason"] = f"concurrency limit reached ({settings.max_concurrent})"
-        elif self.monitor.cpu_percent >= settings.cpu_threshold:
-            summary["admission_blocked_reason"] = "CPU above threshold"
-        elif self.monitor.ram_percent >= settings.ram_threshold:
-            summary["admission_blocked_reason"] = "RAM above threshold"
-        lab_procs = find_lab_processes(str(os.getpid()))
+        else:
+            summary["admission_blocked_reason"] = self._resource_block_reason()
+        lab_procs = self.lab_processes()
+        lab_mem = {"uss_mb": 0.0, "rss_mb": 0.0}
+        methods = set()
+        for s in self.sessions.values():
+            if s.memory_mb is not None:
+                lab_mem["uss_mb"] += s.memory_mb
+                lab_mem["rss_mb"] += s.memory_rss_mb or 0
+                methods.add(s.memory_method)
+        total_mb = self.monitor.memory.total / 1024**2
+        try:
+            backend_rss = psutil.Process().memory_info().rss / 1024**2
+        except psutil.Error:
+            backend_rss = None
         return {
             "ts": time.time(),
             "summary": summary,
-            "system": {**self.monitor.to_dict(), "lab_process_count": len(lab_procs)},
+            "system": {
+                **self.monitor.to_dict(),
+                "lab_process_count": len(lab_procs),
+                "lab_memory": {
+                    "uss_mb": round(lab_mem["uss_mb"], 1),
+                    "rss_mb": round(lab_mem["rss_mb"], 1),
+                    "percent_of_total": round(100 * lab_mem["uss_mb"] / total_mb, 1) if total_mb else 0,
+                    "method": "/".join(sorted(m for m in methods if m)) or None,
+                    "backend_rss_mb": round(backend_rss, 1) if backend_rss else None,
+                },
+            },
             "sessions": [s.to_dict() for s in self.sessions.values()],
             "logs": self.db.recent_logs(limit=log_limit),
         }

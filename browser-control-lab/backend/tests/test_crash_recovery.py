@@ -17,8 +17,8 @@ BASE = f"http://127.0.0.1:{PORT}"
 def _spawn(env):
     proc = subprocess.Popen([sys.executable, "-m", "app.main"], env=env,
                             cwd=os.path.dirname(os.path.dirname(__file__)),
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    for _ in range(100):
+                            stdout=subprocess.DEVNULL, stderr=open(env["LAB_DB_PATH"] + ".log", "a"))
+    for _ in range(300):
         try:
             httpx.get(f"{BASE}/api/health", timeout=0.5)
             return proc
@@ -53,7 +53,9 @@ def test_orphans_reaped_after_crash():
             from playwright.sync_api import sync_playwright
             with sync_playwright() as p:
                 exe = p.chromium.executable_path
+        from app.session_manager import LOCAL_ONLY_BROWSER_ARGS
         fake = subprocess.Popen([exe, "--headless=new", "--no-sandbox", f"{PROCESS_MARKER}={first.pid}:orphan",
+                                 *LOCAL_ONLY_BROWSER_ARGS,
                                  f"--user-data-dir={tempfile.mkdtemp(prefix='blc-orphan-')}", "about:blank"],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         for _ in range(50):
@@ -62,10 +64,22 @@ def test_orphans_reaped_after_crash():
             time.sleep(0.1)
         assert find_lab_processes(str(first.pid)), "orphan simulation failed"
 
+        # A tracked helper that lost its parent and has no marker (as can happen on macOS):
+        # only the tracked_processes table knows about it.
+        helper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True)
+        import sqlite3
+        import psutil
+        con = sqlite3.connect(env["LAB_DB_PATH"])
+        con.execute("INSERT INTO tracked_processes VALUES (?,?,?,?)",
+                    (helper.pid, psutil.Process(helper.pid).create_time(), "orphan", first.pid))
+        con.commit()
+        con.close()
+
         second = _spawn(env)
         try:
             assert find_lab_processes(str(first.pid)) == [], "orphans not reaped on restart"
             fake.wait(timeout=5)
+            helper.wait(timeout=5)  # killed via its tracked (pid, create_time) record
             st = httpx.get(f"{BASE}/api/state").json()
             assert st["summary"]["total"] == 3 and st["summary"]["running"] == 0
             logs = httpx.get(f"{BASE}/api/logs", params={"level": "warning"}).json()

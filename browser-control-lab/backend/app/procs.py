@@ -61,22 +61,6 @@ def kill_lab_processes(marker: str | None = None, timeout: float = 3.0) -> int:
     return len(procs)
 
 
-def process_tree_memory_mb(procs: list[psutil.Process]) -> float:
-    """Unique set size (memory freed if the processes exited); falls back to RSS if unavailable."""
-    total = 0
-    for p in procs:
-        try:
-            total += p.memory_full_info().uss
-        except (psutil.AccessDenied, AttributeError):
-            try:
-                total += p.memory_info().rss
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-        except (psutil.NoSuchProcess, psutil.ZombieProcess):
-            pass
-    return total / (1024 * 1024)
-
-
 def _owner_alive(value: str) -> bool:
     owner = value.split(":", 1)[0]
     try:
@@ -102,3 +86,65 @@ def kill_orphaned_lab_processes() -> int:
         if value is not None and not _owner_alive(value):
             owners.add(value.split(":", 1)[0])
     return sum(kill_lab_processes(owner) for owner in owners)
+
+
+# --------------------------------------------------------------------------- PID tracking
+# Chromium's helper processes (renderer, GPU, network) do not carry the command-line
+# marker; they are found as *descendants* of the marked browser process. If the browser
+# process dies first, helpers are re-parented (to launchd on macOS, init on Linux) and the
+# descendant search can no longer see them. So every PID seen while a session runs is
+# recorded together with its start time, and cleanup also kills any recorded PID that is
+# still alive *and* still has the same start time (guards against PID reuse).
+
+TrackedPid = tuple[int, float]  # (pid, create_time)
+
+
+def snapshot_pids(procs: list[psutil.Process]) -> set[TrackedPid]:
+    out: set[TrackedPid] = set()
+    for p in procs:
+        try:
+            out.add((p.pid, p.create_time()))
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            pass
+    return out
+
+
+def alive_tracked(tracked: set[TrackedPid] | list[TrackedPid]) -> list[psutil.Process]:
+    alive = []
+    for pid, ctime in list(tracked):
+        try:
+            p = psutil.Process(pid)
+            if abs(p.create_time() - ctime) < 0.05 and p.status() != psutil.STATUS_ZOMBIE:
+                alive.append(p)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            pass
+    return alive
+
+
+def kill_tracked(tracked: set[TrackedPid] | list[TrackedPid], timeout: float = 3.0) -> int:
+    procs = alive_tracked(tracked)
+    for p in procs:
+        try:
+            p.terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    _, alive = psutil.wait_procs(procs, timeout=timeout)
+    for p in alive:
+        try:
+            p.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    psutil.wait_procs(alive, timeout=timeout)
+    return len(procs)
+
+
+def describe(procs: list[psutil.Process]) -> list[dict]:
+    out = []
+    for p in procs:
+        try:
+            out.append({"pid": p.pid, "name": p.name(), "ppid": p.ppid(),
+                        "rss_mb": round(p.memory_info().rss / 1024**2, 1),
+                        "marker": _marker_value(p)})
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            pass
+    return out

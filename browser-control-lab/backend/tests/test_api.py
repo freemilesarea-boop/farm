@@ -161,3 +161,60 @@ def test_max_sessions_registration(server):
 def test_scenario_must_be_whitelisted(server):
     r = server.post("/api/sessions", json={"count": 1, "scenario": "https://example.com"})
     assert r.status_code == 422
+
+
+def test_stop_all_verifies_no_processes_remain(server):
+    ids = [s["id"] for s in server.post("/api/sessions", json={"count": 3}).json()]
+    server.post("/api/sessions/start-all")
+    _wait(server, lambda st: all(_by_id(st, i)["process_count"] > 0 for i in ids))
+    procs = server.get("/api/processes").json()
+    assert procs["count"] >= 3 and procs["tracked_pids"] >= procs["count"] - 3
+    out = server.post("/api/sessions/stop-all").json()
+    assert out["verified_clean"] is True and out["remaining_processes"] == 0
+    assert server.get("/api/processes").json()["count"] == 0
+    assert find_lab_processes(str(os.getpid())) == []
+
+
+def test_memory_fields_in_state(server):
+    sid = server.post("/api/sessions", json={"count": 1}).json()[0]["id"]
+    server.post(f"/api/sessions/{sid}/start")
+    st = _wait(server, lambda st: _by_id(st, sid)["memory_mb"] is not None)
+    s = _by_id(st, sid)
+    assert 0 < s["memory_mb"] <= s["memory_rss_mb"] and s["memory_method"] in ("uss", "uss+rss", "rss")
+    sysd = st["system"]
+    assert sysd["lab_memory"]["uss_mb"] > 0 and sysd["lab_memory"]["rss_mb"] >= sysd["lab_memory"]["uss_mb"]
+    mem = sysd["memory"]
+    assert mem["total_gb"] > 0 and mem["pressure"]["level"] in ("normal", "warn", "critical", "unknown")
+    assert {"total_gb", "used_gb", "percent", "in_mb_s", "out_mb_s"} <= set(mem["swap"])
+
+
+def test_register_replace_prevents_accumulation(server):
+    server.post("/api/sessions", json={"count": 4})
+    r = server.post("/api/sessions", json={"count": 2, "replace": True})
+    assert r.status_code == 201 and len(r.json()) == 2
+    assert server.get("/api/state").json()["summary"]["total"] == 2
+    # default is still additive
+    server.post("/api/sessions", json={"count": 1})
+    assert server.get("/api/state").json()["summary"]["total"] == 3
+
+
+def test_replace_stops_running_sessions(server):
+    sid = server.post("/api/sessions", json={"count": 1}).json()[0]["id"]
+    server.post(f"/api/sessions/{sid}/start")
+    _wait(server, lambda st: _by_id(st, sid)["status"] == "running")
+    server.post("/api/sessions", json={"count": 1, "replace": True})
+    assert find_lab_processes(f"{os.getpid()}:{sid}") == []
+    assert all(s["id"] != sid for s in server.get("/api/state").json()["sessions"])
+
+
+def test_memory_pressure_blocks(server, monkeypatch):
+    import dataclasses
+    import app.session_manager as sm
+    from app.main import manager
+    sid = server.post("/api/sessions", json={"count": 1}).json()[0]["id"]
+    monkeypatch.setattr(manager.monitor, "refresh_memory", lambda: None)
+    monkeypatch.setattr(manager.monitor.memory, "pressure", {"level": "warn"})
+    r = server.post(f"/api/sessions/{sid}/start")
+    assert r.status_code == 429 and "pressure" in r.json()["detail"]
+    monkeypatch.setattr(sm, "settings", dataclasses.replace(settings, pressure_block_level="critical"))
+    assert server.post(f"/api/sessions/{sid}/start").status_code == 200
