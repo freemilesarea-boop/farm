@@ -1,0 +1,6 @@
+sessions,started,blocked,blocked_reason,running_at_end,error_sessions,ramp_up_s,cpu_avg,cpu_max,ram_used_pct_avg,ram_used_pct_max,ram_psutil_pct_avg,ram_used_gb_avg,lab_uss_mb_avg,lab_rss_mb_avg,uss_mb_per_session,rss_mb_per_session,memory_method,chromium_procs,pressure_worst,swap_used_gb_delta,swap_out_mb_s_max,iterations,errors,isolation_ok,load_ms_avg,load_ms_p95,stop_all_s,stop_verified_clean,leftover_processes
+0,0,,,,,,0.97,2.2,4.3,4.3,4.3,0.68,0.0,0.0,,,,0,normal,0.0,,,0,,,,,,0
+1,1,0,,1,0,0.8,3.86,14.5,5.67,5.7,5.67,0.9,154.62,857.45,163.9,891.3,uss,9,normal,0.0,0.0,7,0,True,37.3,37.3,0.1,True,0
+3,3,0,,3,0,0.6,8.47,28.3,7.45,7.6,7.45,1.17,327.3,2525.97,119.5,891.6,uss,27,normal,0.0,0.0,21,0,True,70.1,70.3,0.2,True,0
+6,6,0,,6,0,2.3,15.87,48.9,10.39,10.8,10.39,1.63,675.52,5239.91,118.3,892.1,uss,54,normal,0.0,0.0,45,0,True,51.4,63.3,0.7,True,0
+10,10,0,,10,0,5.9,19.76,53.2,14.32,14.5,14.32,2.25,1141.25,8828.12,118.5,891.6,uss,90,normal,0.0,0.0,82,0,True,55.3,63.9,1.2,True,0
