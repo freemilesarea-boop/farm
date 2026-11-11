@@ -6,6 +6,39 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+PROJECT_DIR = BASE_DIR.parent
+
+
+def load_env_file(path: Path) -> dict[str, str]:
+    """Load ``LAB_*=value`` lines from a machine settings file into os.environ.
+
+    Values already present in the environment win, so a one-off
+    ``LAB_MAX_CONCURRENT=10 ./scripts/dev.sh`` still overrides the file. Only LAB_*
+    keys are accepted; blank lines and ``#`` comments are ignored. Returns what was applied.
+    """
+    applied: dict[str, str] = {}
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return applied
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.split("#", 1)[0].strip().strip('"').strip("'")
+        if key.startswith("export "):
+            key = key[len("export "):].strip()
+        if not key.startswith("LAB_") or key in os.environ:
+            continue
+        os.environ[key] = value
+        applied[key] = value
+    return applied
+
+
+# Per-machine settings (e.g. the dedicated Mac mini). Override path with LAB_ENV_FILE.
+ENV_FILE = Path(os.environ.get("LAB_ENV_FILE", str(PROJECT_DIR / "lab.env")))
+ENV_FILE_APPLIED = load_env_file(ENV_FILE)
 
 
 def _env_int(name: str, default: int) -> int:
