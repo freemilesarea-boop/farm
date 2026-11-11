@@ -1,0 +1,539 @@
+"""Playwright session manager.
+
+Each test session owns a *separate* Chromium process (own profile, own cookie jar and
+storage), tagged with a command-line marker ``--blc-lab-marker=<server_pid>:<session_id>``
+so its whole process tree can be found and terminated, even after a server crash.
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+import time
+import uuid
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any
+
+import psutil
+from playwright.async_api import Browser, BrowserContext, Page, Playwright, Route, async_playwright
+
+from .config import PROCESS_MARKER, settings
+from .db import Database
+from .procs import find_lab_processes, kill_lab_processes, process_tree_memory_mb
+from .security import assert_local_url, is_local_url, redact
+from .testpages import SCENARIOS
+
+ACTIVE_STATES = {"starting", "running", "stopping"}
+
+# Browser-level network lockdown. The per-page route guard only sees page traffic;
+# these flags also stop Chromium's own background services (updates, sync, GCM, ...)
+# from reaching any non-local host: no proxy, and every hostname except localhost
+# resolves to NOTFOUND.
+LOCAL_ONLY_BROWSER_ARGS = [
+    "--no-proxy-server",
+    "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE localhost, EXCLUDE 127.0.0.1",
+    "--disable-background-networking",
+    "--disable-component-update",
+    "--disable-sync",
+    "--disable-default-apps",
+    "--disable-domain-reliability",
+    "--disable-extensions",
+    "--no-first-run",
+    "--no-pings",
+]
+MAX_CONSECUTIVE_FAILURES = 5
+
+
+class LimitError(RuntimeError):
+    """Raised when a request would exceed session / resource limits."""
+
+
+@dataclass
+class TestSession:
+    id: str
+    name: str
+    scenario: str
+    created_at: float
+    status: str = "idle"
+    started_at: float | None = None
+    stopped_at: float | None = None
+    iterations: int = 0
+    errors: int = 0
+    consecutive_failures: int = 0
+    last_load_ms: float | None = None
+    last_ttfb_ms: float | None = None
+    total_load_ms: float = 0.0
+    ok_iterations: int = 0
+    isolation_ok: bool | None = None
+    blocked_requests: int = 0
+    last_error: str | None = None
+    memory_mb: float | None = None
+    process_count: int = 0
+    run_id: int | None = None
+    crashed: bool = False
+    # runtime handles (not serialised)
+    task: asyncio.Task | None = field(default=None, repr=False)
+    stop_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    browser: Browser | None = field(default=None, repr=False)
+
+    @property
+    def marker(self) -> str:
+        return f"{os.getpid()}:{self.id}"
+
+    @property
+    def target_url(self) -> str:
+        return f"http://127.0.0.1:{settings.port}{SCENARIOS[self.scenario]['path']}"
+
+    @property
+    def avg_load_ms(self) -> float | None:
+        return round(self.total_load_ms / self.ok_iterations, 1) if self.ok_iterations else None
+
+    def uptime_s(self) -> float:
+        if self.started_at is None:
+            return 0.0
+        end = self.stopped_at if self.status not in ACTIVE_STATES else time.time()
+        return max(0.0, (end or time.time()) - self.started_at)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "scenario": self.scenario,
+            "target_url": self.target_url,
+            "status": self.status,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "uptime_s": round(self.uptime_s(), 1),
+            "iterations": self.iterations,
+            "errors": self.errors,
+            "last_load_ms": self.last_load_ms,
+            "last_ttfb_ms": self.last_ttfb_ms,
+            "avg_load_ms": self.avg_load_ms,
+            "isolation_ok": self.isolation_ok,
+            "blocked_requests": self.blocked_requests,
+            "last_error": self.last_error,
+            "memory_mb": self.memory_mb,
+            "process_count": self.process_count,
+        }
+
+
+class SystemMonitor:
+    """Samples CPU/RAM in the background so guards never block on psutil intervals."""
+
+    def __init__(self) -> None:
+        self.cpu_percent = 0.0
+        self.ram_percent = psutil.virtual_memory().percent
+        self.ram_used_gb = 0.0
+        self.ram_total_gb = psutil.virtual_memory().total / 1024**3
+        self.cpu_count = psutil.cpu_count(logical=True) or 1
+        # CPU is a moving average of the last 3 one-second samples, so a single
+        # spike (e.g. one Chromium launching) does not flip the admission guard.
+        self._cpu_samples: deque[float] = deque(maxlen=3)
+        psutil.cpu_percent(interval=None)  # prime; first real sample comes 1 s later
+
+    def sample(self) -> None:
+        self._cpu_samples.append(psutil.cpu_percent(interval=None))
+        self.cpu_percent = sum(self._cpu_samples) / len(self._cpu_samples)
+        vm = psutil.virtual_memory()
+        self.ram_percent = vm.percent
+        self.ram_used_gb = (vm.total - vm.available) / 1024**3
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "cpu_percent": round(self.cpu_percent, 1),
+            "ram_percent": round(self.ram_percent, 1),
+            "ram_used_gb": round(self.ram_used_gb, 2),
+            "ram_total_gb": round(self.ram_total_gb, 2),
+            "cpu_count": self.cpu_count,
+        }
+
+
+class SessionManager:
+    def __init__(self, db: Database):
+        self.db = db
+        self.sessions: dict[str, TestSession] = {}
+        self.monitor = SystemMonitor()
+        self._pw_cm = None
+        self._pw: Playwright | None = None
+        self._pw_lock = asyncio.Lock()
+        self._launch_sem = asyncio.Semaphore(3)  # avoid launching many Chromiums at once
+        self._sampler: asyncio.Task | None = None
+        self._lock = asyncio.Lock()  # guards admission decisions
+
+    # ------------------------------------------------------------------ lifecycle
+    async def startup(self) -> None:
+        recovered = self.db.mark_unclean_sessions()
+        from .procs import kill_orphaned_lab_processes
+
+        killed = kill_orphaned_lab_processes()
+        if recovered or killed:
+            self.db.log("warning", "Recovered from unclean shutdown",
+                        data={"sessions_reset": recovered, "orphan_processes_killed": killed})
+        for row in self.db.list_sessions():
+            if row["scenario"] not in SCENARIOS:
+                continue
+            self.sessions[row["id"]] = TestSession(
+                id=row["id"], name=row["name"], scenario=row["scenario"], created_at=row["created_at"],
+                status="idle" if row["last_status"] in ACTIVE_STATES else row["last_status"],
+            )
+        self._sampler = asyncio.create_task(self._sample_loop())
+        self.db.log("info", "Server started",
+                    data={"sessions_loaded": len(self.sessions), "max_concurrent": settings.max_concurrent})
+
+    async def shutdown(self) -> None:
+        await self.stop_all(reason="server_shutdown")
+        if self._sampler:
+            self._sampler.cancel()
+        if self._pw_cm is not None:
+            try:
+                await self._pw_cm.__aexit__(None, None, None)
+            except Exception:
+                pass
+            self._pw_cm = self._pw = None
+        leftover = kill_lab_processes(str(os.getpid()))
+        self.db.log("info", "Server stopped", data={"leftover_processes_killed": leftover})
+
+    async def _playwright(self) -> Playwright:
+        async with self._pw_lock:
+            if self._pw is None:
+                self._pw_cm = async_playwright()
+                self._pw = await self._pw_cm.__aenter__()
+            return self._pw
+
+    async def _sample_loop(self) -> None:
+        while True:
+            await asyncio.sleep(1.0)
+            try:
+                self.monitor.sample()
+                for s in list(self.sessions.values()):
+                    if s.status in ACTIVE_STATES:
+                        procs = await asyncio.to_thread(find_lab_processes, s.marker)
+                        s.process_count = len(procs)
+                        s.memory_mb = round(process_tree_memory_mb(procs), 1)
+                    else:
+                        s.process_count = 0
+                        s.memory_mb = None
+            except Exception as exc:  # never let the sampler die
+                self.db.log("error", f"Monitor sampling failed: {exc}")
+
+    # ------------------------------------------------------------------ registry
+    def create_sessions(self, count: int, scenario: str, name_prefix: str | None = None) -> list[TestSession]:
+        if scenario not in SCENARIOS:
+            raise ValueError(f"Unknown scenario {scenario!r}")
+        if count < 1:
+            raise ValueError("count must be >= 1")
+        if len(self.sessions) + count > settings.max_sessions:
+            raise LimitError(
+                f"Session limit reached: {len(self.sessions)} registered, max {settings.max_sessions}"
+            )
+        created = []
+        for _ in range(count):
+            sid = uuid.uuid4().hex[:10]
+            n = len(self.sessions) + 1
+            s = TestSession(id=sid, name=f"{name_prefix or 'session'}-{n:03d}", scenario=scenario,
+                            created_at=time.time())
+            self.sessions[sid] = s
+            self.db.insert_session(s.id, s.name, s.scenario, s.created_at)
+            created.append(s)
+        self.db.log("info", f"Registered {count} session(s)", data={"scenario": scenario})
+        return created
+
+    def get(self, sid: str) -> TestSession:
+        try:
+            return self.sessions[sid]
+        except KeyError:
+            raise KeyError(f"Session {sid} not found") from None
+
+    async def delete_session(self, sid: str) -> None:
+        s = self.get(sid)
+        if s.status in ACTIVE_STATES:
+            await self.stop(sid, reason="deleted")
+        del self.sessions[sid]
+        self.db.delete_session(sid)
+        self.db.log("info", f"Deleted session {s.name}", session_id=sid)
+
+    # ------------------------------------------------------------------ admission control
+    def active_count(self) -> int:
+        return sum(1 for s in self.sessions.values() if s.status in ("starting", "running"))
+
+    def admission_check(self) -> str | None:
+        """Return a reason string if a new browser may NOT be started right now."""
+        if self.active_count() >= settings.max_concurrent:
+            return f"concurrency limit reached ({settings.max_concurrent})"
+        # CPU comes from the 1 s background sampler; RAM is read fresh (cheap and instantaneous).
+        self.monitor.ram_percent = psutil.virtual_memory().percent
+        if self.monitor.cpu_percent >= settings.cpu_threshold:
+            return f"CPU {self.monitor.cpu_percent:.0f}% >= threshold {settings.cpu_threshold:.0f}%"
+        if self.monitor.ram_percent >= settings.ram_threshold:
+            return f"RAM {self.monitor.ram_percent:.0f}% >= threshold {settings.ram_threshold:.0f}%"
+        return None
+
+    # ------------------------------------------------------------------ control
+    async def start(self, sid: str) -> TestSession:
+        s = self.get(sid)
+        async with self._lock:
+            if s.status in ACTIVE_STATES:
+                return s
+            reason = self.admission_check()
+            if reason:
+                self.db.log("warning", f"Start blocked: {reason}", session_id=sid)
+                raise LimitError(reason)
+            assert_local_url(s.target_url)
+            self._reset_metrics(s)
+            s.status = "starting"
+            s.started_at = time.time()
+            s.stopped_at = None
+            s.stop_event = asyncio.Event()
+            s.run_id = self.db.start_run(s.id, s.started_at)
+            self.db.set_session_status(s.id, s.status)
+            s.task = asyncio.create_task(self._run(s), name=f"session-{s.id}")
+        self.db.log("info", f"Starting {s.name}", session_id=sid, data={"target": s.target_url})
+        return s
+
+    async def stop(self, sid: str, reason: str = "user_stop") -> TestSession:
+        s = self.get(sid)
+        if s.status not in ACTIVE_STATES or s.task is None:
+            return s
+        s.status = "stopping"
+        s.stop_event.set()
+        try:
+            await asyncio.wait_for(asyncio.shield(s.task), timeout=20)
+        except asyncio.TimeoutError:
+            s.task.cancel()
+            self.db.log("warning", "Session did not stop in time; cancelled", session_id=sid)
+        except Exception:
+            pass
+        if reason != "user_stop":
+            self.db.log("info", f"Stopped {s.name} ({reason})", session_id=sid)
+        return s
+
+    async def restart(self, sid: str) -> TestSession:
+        await self.stop(sid, reason="restart")
+        return await self.start(sid)
+
+    async def start_all(self, wave_size: int = 3) -> dict[str, Any]:
+        """Start idle sessions in small waves. After each wave we wait until its browsers are up
+        and take a fresh CPU/RAM reading, so the resource guard sees the real load before
+        admitting more (otherwise a bulk start would admit everything before CPU rises)."""
+        started, skipped = [], []
+        pending = [s for s in self.sessions.values() if s.status not in ACTIVE_STATES]
+        blocked_reason: str | None = None
+        for i in range(0, len(pending), wave_size):
+            wave = []
+            for s in pending[i:i + wave_size]:
+                if blocked_reason is None:
+                    try:
+                        await self.start(s.id)
+                        started.append(s.id)
+                        wave.append(s)
+                        continue
+                    except LimitError as exc:
+                        blocked_reason = str(exc)
+                skipped.append({"id": s.id, "reason": blocked_reason})
+            if blocked_reason is not None:
+                continue
+            deadline = time.time() + 30
+            while time.time() < deadline and any(s.status == "starting" for s in wave):
+                await asyncio.sleep(0.2)
+            if i + wave_size < len(pending):
+                await asyncio.sleep(1.0)
+                self.monitor.sample()  # fresh reading including the wave just launched
+        if skipped:
+            self.db.log("warning", f"Start-all: {len(started)} started, {len(skipped)} blocked",
+                        data={"first_reason": skipped[0]["reason"]})
+        else:
+            self.db.log("info", f"Start-all: {len(started)} started")
+        return {"started": started, "skipped": skipped}
+
+    async def stop_all(self, reason: str = "stop_all") -> dict[str, Any]:
+        targets = [s.id for s in self.sessions.values() if s.status in ACTIVE_STATES]
+        await asyncio.gather(*(self.stop(sid, reason=reason) for sid in targets), return_exceptions=True)
+        leftover = await asyncio.to_thread(kill_lab_processes, str(os.getpid()))
+        self.db.log("info", f"Stop-all ({reason}): {len(targets)} session(s) stopped",
+                    data={"leftover_processes_killed": leftover})
+        return {"stopped": targets, "leftover_processes_killed": leftover}
+
+    # ------------------------------------------------------------------ session worker
+    @staticmethod
+    def _reset_metrics(s: TestSession) -> None:
+        s.iterations = s.errors = s.consecutive_failures = s.ok_iterations = s.blocked_requests = 0
+        s.total_load_ms = 0.0
+        s.last_load_ms = s.last_ttfb_ms = None
+        s.isolation_ok = None
+        s.last_error = None
+        s.crashed = False
+
+    def _record_error(self, s: TestSession, message: str) -> None:
+        s.errors += 1
+        s.consecutive_failures += 1
+        s.last_error = redact(message)[:500]
+        self.db.log("error", s.last_error, session_id=s.id, data={"iteration": s.iterations})
+
+    async def _run(self, s: TestSession) -> None:
+        end_reason = "stopped"
+        context: BrowserContext | None = None
+        try:
+            pw = await self._playwright()
+            async with self._launch_sem:
+                if s.stop_event.is_set():
+                    return
+                s.browser = await pw.chromium.launch(
+                    headless=settings.headless,
+                    executable_path=settings.chromium_executable,
+                    args=[f"{PROCESS_MARKER}={s.marker}", *LOCAL_ONLY_BROWSER_ARGS],
+                )
+            s.browser.on("disconnected", lambda _b: self._on_disconnect(s))
+            context = await s.browser.new_context(viewport={"width": 1280, "height": 800})
+            await context.route("**/*", lambda route: self._guard_route(s, route))
+            page = await context.new_page()
+            page.set_default_timeout(settings.page_timeout_ms)
+            if not s.stop_event.is_set():
+                s.status = "running"
+                self.db.set_session_status(s.id, s.status)
+            self.db.log("info", f"{s.name} running (browser {s.browser.version})", session_id=s.id)
+
+            while not s.stop_event.is_set():
+                await self._iteration(s, page)
+                if s.consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    end_reason = "error"
+                    self.db.log("error", f"{s.name}: {MAX_CONSECUTIVE_FAILURES} consecutive failures, stopping",
+                                session_id=s.id)
+                    break
+                if s.browser is None or not s.browser.is_connected():
+                    end_reason = "error"
+                    break
+                try:
+                    await asyncio.wait_for(s.stop_event.wait(), timeout=settings.iteration_interval)
+                except asyncio.TimeoutError:
+                    pass
+            if s.crashed:
+                end_reason = "error"
+        except asyncio.CancelledError:
+            end_reason = "cancelled"
+            raise
+        except Exception as exc:
+            end_reason = "error"
+            self._record_error(s, f"Session crashed: {type(exc).__name__}: {exc}")
+        finally:
+            await self._cleanup(s, context)
+            s.stopped_at = time.time()
+            s.status = "error" if end_reason == "error" else "stopped"
+            self.db.set_session_status(s.id, s.status)
+            if s.run_id is not None:
+                self.db.end_run(s.run_id, end_reason, s.iterations, s.errors, s.avg_load_ms)
+            s.task = None
+
+    def _on_disconnect(self, s: TestSession) -> None:
+        if s.status == "running" and not s.stop_event.is_set():
+            s.crashed = True
+            self._record_error(s, "Browser disconnected unexpectedly")
+            s.stop_event.set()
+
+    async def _guard_route(self, s: TestSession, route: Route) -> None:
+        url = route.request.url
+        if is_local_url(url):
+            await route.continue_()
+        else:
+            s.blocked_requests += 1
+            self.db.log("warning", f"Blocked non-local request to {url[:200]}", session_id=s.id)
+            await route.abort("blockedbyclient")
+
+    async def _iteration(self, s: TestSession, page: Page) -> None:
+        s.iterations += 1
+        t0 = time.perf_counter()
+        try:
+            resp = await page.goto(s.target_url, wait_until="load")
+            elapsed = (time.perf_counter() - t0) * 1000
+            status = resp.status if resp else 0
+            if status >= 400 or status == 0:
+                self._record_error(s, f"HTTP {status} from {s.target_url}")
+                s.last_load_ms = round(elapsed, 1)
+                return
+            timing = await page.evaluate(
+                """() => { const n = performance.getEntriesByType('navigation')[0];
+                           return n ? {ttfb: n.responseStart - n.requestStart, load: n.loadEventEnd - n.startTime} : null; }"""
+            )
+            s.last_load_ms = round(elapsed, 1)
+            s.last_ttfb_ms = round(timing["ttfb"], 1) if timing else None
+            s.total_load_ms += elapsed
+            s.ok_iterations += 1
+            await self._check_isolation(s, page)
+            s.consecutive_failures = 0
+        except Exception as exc:
+            if s.stop_event.is_set():
+                return  # navigation interrupted by shutdown; not a test failure
+            self._record_error(s, f"{type(exc).__name__}: {str(exc).splitlines()[0] if str(exc) else ''}")
+
+    async def _check_isolation(self, s: TestSession, page: Page) -> None:
+        """Each session writes its own id to localStorage + a cookie and must only ever read back its own."""
+        result = await page.evaluate(
+            """async (sid) => {
+                 const before = localStorage.getItem('lab_sid');
+                 if (!before) { localStorage.setItem('lab_sid', sid); document.cookie = 'lab_sid=' + sid + '; path=/'; }
+                 const r = await fetch('/lab/whoami', {credentials: 'same-origin'});
+                 const who = await r.json();
+                 return {before, storage: localStorage.getItem('lab_sid'), cookie: who.lab_sid};
+               }""",
+            s.id,
+        )
+        ok = result["storage"] == s.id and result["cookie"] == s.id and result["before"] in (None, s.id)
+        if not ok and s.isolation_ok is not False:
+            self.db.log("error", "Isolation check failed", session_id=s.id, data=result)
+        s.isolation_ok = ok
+
+    async def _cleanup(self, s: TestSession, context: BrowserContext | None) -> None:
+        s.stop_event.set()  # marks the coming disconnect as intentional
+        try:
+            if context is not None:
+                await asyncio.wait_for(context.close(), timeout=5)
+        except Exception:
+            pass
+        try:
+            if s.browser is not None:
+                await asyncio.wait_for(s.browser.close(), timeout=5)
+        except Exception:
+            pass
+        s.browser = None
+        # Belt and braces: make sure no process of this session survives.
+        killed = await asyncio.to_thread(kill_lab_processes, s.marker)
+        remaining = await asyncio.to_thread(find_lab_processes, s.marker)
+        s.process_count = len(remaining)
+        s.memory_mb = None
+        if remaining:
+            self.db.log("error", f"Cleanup incomplete: {len(remaining)} process(es) remain", session_id=s.id)
+        else:
+            self.db.log("info", f"{s.name} cleaned up (forced kills: {killed})", session_id=s.id)
+
+    # ------------------------------------------------------------------ views
+    def summary(self) -> dict[str, Any]:
+        statuses = [s.status for s in self.sessions.values()]
+        return {
+            "total": len(statuses),
+            "running": statuses.count("running"),
+            "starting": statuses.count("starting"),
+            "stopping": statuses.count("stopping"),
+            "error": statuses.count("error"),
+            "idle": statuses.count("idle") + statuses.count("stopped"),
+            "max_sessions": settings.max_sessions,
+            "max_concurrent": settings.max_concurrent,
+            "cpu_threshold": settings.cpu_threshold,
+            "ram_threshold": settings.ram_threshold,
+            "admission_blocked_reason": None,
+        }
+
+    def snapshot(self, log_limit: int = 50) -> dict[str, Any]:
+        summary = self.summary()
+        if summary["running"] + summary["starting"] >= settings.max_concurrent:
+            summary["admission_blocked_reason"] = f"concurrency limit reached ({settings.max_concurrent})"
+        elif self.monitor.cpu_percent >= settings.cpu_threshold:
+            summary["admission_blocked_reason"] = "CPU above threshold"
+        elif self.monitor.ram_percent >= settings.ram_threshold:
+            summary["admission_blocked_reason"] = "RAM above threshold"
+        lab_procs = find_lab_processes(str(os.getpid()))
+        return {
+            "ts": time.time(),
+            "summary": summary,
+            "system": {**self.monitor.to_dict(), "lab_process_count": len(lab_procs)},
+            "sessions": [s.to_dict() for s in self.sessions.values()],
+            "logs": self.db.recent_logs(limit=log_limit),
+        }

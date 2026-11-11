@@ -1,0 +1,6 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+playwright>=1.48
+psutil>=6.0
+pytest>=8.0
+httpx>=0.27
