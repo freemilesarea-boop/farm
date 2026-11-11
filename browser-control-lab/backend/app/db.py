@@ -57,6 +57,9 @@ class Database:
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.executescript(SCHEMA)
+            cols = {r[1] for r in self._conn.execute("PRAGMA table_info(sessions)")}
+            if "config" not in cols:  # migration: per-session config (custom URL scenario)
+                self._conn.execute("ALTER TABLE sessions ADD COLUMN config TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -71,10 +74,11 @@ class Database:
             return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
 
     # ---- sessions
-    def insert_session(self, sid: str, name: str, scenario: str, created_at: float) -> None:
+    def insert_session(self, sid: str, name: str, scenario: str, created_at: float,
+                       config: dict | None = None) -> None:
         self._exec(
-            "INSERT INTO sessions(id, name, scenario, created_at) VALUES (?,?,?,?)",
-            (sid, name, scenario, created_at),
+            "INSERT INTO sessions(id, name, scenario, created_at, config) VALUES (?,?,?,?,?)",
+            (sid, name, scenario, created_at, json.dumps(config) if config else None),
         )
 
     def delete_session(self, sid: str) -> None:
@@ -84,7 +88,10 @@ class Database:
         self._exec("UPDATE sessions SET last_status=? WHERE id=?", (status, sid))
 
     def list_sessions(self) -> list[dict[str, Any]]:
-        return self._all("SELECT * FROM sessions ORDER BY created_at, id")
+        rows = self._all("SELECT * FROM sessions ORDER BY created_at, id")
+        for r in rows:
+            r["config"] = json.loads(r["config"]) if r.get("config") else None
+        return rows
 
     def mark_unclean_sessions(self) -> int:
         """After a crash, sessions recorded as active are reset; returns how many."""

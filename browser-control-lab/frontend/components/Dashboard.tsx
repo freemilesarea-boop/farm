@@ -1,7 +1,7 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { api, LabState, LogEntry, PressureLevel, Scenario, Session, SessionStatus } from "@/lib/api";
+import { useEffect, useMemo, useState } from "react";
+import { api, CustomMode, LabConfig, LabState, LogEntry, PressureLevel, Scenario, Session, SessionStatus, VideoState } from "@/lib/api";
 import { Connection, useLabState } from "@/lib/useLabState";
 
 const SCENARIOS: { value: Scenario; label: string }[] = [
@@ -10,6 +10,7 @@ const SCENARIOS: { value: Scenario; label: string }[] = [
   { value: "slow", label: "slow — 800ms 지연" },
   { value: "flaky", label: "flaky — 30% 실패" },
   { value: "error", label: "error — 항상 500" },
+  { value: "custom", label: "custom — 사용자 지정 URL" },
 ];
 
 const STATUS_STYLE: Record<SessionStatus, string> = {
@@ -312,6 +313,14 @@ function Controls({ state, busy, run }: { state: LabState; busy: string | null; 
   const [count, setCount] = useState(6);
   const [scenario, setScenario] = useState<Scenario>("basic");
   const [confirming, setConfirming] = useState(false);
+  const [custom, setCustom] = useState({ url: "", mode: "page_load" as CustomMode, reload_interval_s: 10, muted: true, loop: true });
+  const [config, setConfig] = useState<LabConfig | null>(null);
+  useEffect(() => {
+    api<LabConfig>("/api/config").then(setConfig).catch(() => setConfig(null));
+  }, []);
+  const isCustom = scenario === "custom";
+  const urlLooksOk = /^https?:\/\/[^\s/]+/i.test(custom.url.trim());
+  const canRegister = !isCustom || urlLooksOk;
   const existing = state.summary.total;
   const running = state.summary.running + state.summary.starting;
   const remaining = state.summary.max_sessions - existing;
@@ -321,7 +330,11 @@ function Controls({ state, busy, run }: { state: LabState; busy: string | null; 
   const register = (replace: boolean) =>
     run(
       "create",
-      () => api("/api/sessions", { method: "POST", body: JSON.stringify({ count, scenario, replace }) }),
+      () =>
+        api("/api/sessions", {
+          method: "POST",
+          body: JSON.stringify({ count, scenario, replace, ...(isCustom ? { custom: { ...custom, url: custom.url.trim() } } : {}) }),
+        }),
       (r) => (replace ? `기존 ${existing}개를 삭제하고 ${r.length}개로 교체했습니다` : `${r.length}개 추가 등록 (총 ${existing + r.length}개)`),
     ).then(() => setConfirming(false));
 
@@ -343,10 +356,13 @@ function Controls({ state, busy, run }: { state: LabState; busy: string | null; 
           />
         </label>
         <label className="flex flex-col gap-1 text-xs font-medium text-slate-500 dark:text-slate-400">
-          테스트 시나리오 (로컬 페이지)
+          테스트 시나리오
           <select
             value={scenario}
-            onChange={(e) => setScenario(e.target.value as Scenario)}
+            onChange={(e) => {
+              setScenario(e.target.value as Scenario);
+              setConfirming(false);
+            }}
             className="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
           >
             {SCENARIOS.map((s) => (
@@ -356,7 +372,11 @@ function Controls({ state, busy, run }: { state: LabState; busy: string | null; 
             ))}
           </select>
         </label>
-        <Btn disabled={!!busy || confirming} onClick={() => (existing === 0 ? register(false) : setConfirming(true))}>
+        <Btn
+          disabled={!!busy || confirming || !canRegister}
+          title={!canRegister ? "http:// 또는 https:// 로 시작하는 URL을 입력하세요" : undefined}
+          onClick={() => (existing === 0 ? register(false) : setConfirming(true))}
+        >
           세션 등록
         </Btn>
         <div className="mx-1 hidden h-8 w-px bg-slate-200 sm:block dark:bg-slate-800" />
@@ -408,6 +428,8 @@ function Controls({ state, busy, run }: { state: LabState; busy: string | null; 
         </div>
       </div>
 
+      {isCustom && <CustomPanel custom={custom} setCustom={setCustom} config={config} urlLooksOk={urlLooksOk} />}
+
       {confirming && (
         <div
           role="alertdialog"
@@ -444,6 +466,188 @@ function Controls({ state, busy, run }: { state: LabState; busy: string | null; 
   );
 }
 
+type CustomForm = { url: string; mode: CustomMode; reload_interval_s: number; muted: boolean; loop: boolean };
+
+function CustomPanel({
+  custom,
+  setCustom,
+  config,
+  urlLooksOk,
+}: {
+  custom: CustomForm;
+  setCustom: (c: CustomForm) => void;
+  config: LabConfig | null;
+  urlLooksOk: boolean;
+}) {
+  const [check, setCheck] = useState<{ ok: boolean; text: string } | null>(null);
+  const [copied, setCopied] = useState(false);
+  const c = config?.custom;
+  const set = (patch: Partial<CustomForm>) => {
+    setCustom({ ...custom, ...patch });
+    setCheck(null);
+  };
+  const validate = async () => {
+    try {
+      const r: any = await api("/api/custom/validate", { method: "POST", body: JSON.stringify({ url: custom.url.trim() }) });
+      setCheck({
+        ok: true,
+        text: r.local
+          ? `허용됨 (localhost): ${r.url}`
+          : `허용됨: ${r.host} → ${r.resolved_ips.join(", ")}${r.verification_required ? ` · 시작 시 소유권 확인: ${r.verify_url}` : ""}`,
+      });
+    } catch (e) {
+      setCheck({ ok: false, text: (e as Error).message });
+    }
+  };
+  const input =
+    "rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100";
+  const lbl = "flex flex-col gap-1 text-xs font-medium text-slate-500 dark:text-slate-400";
+  const apiBase = (process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
+  return (
+    <section aria-label="사용자 지정 URL 설정" className="mt-3 rounded-lg border border-sky-200 bg-sky-50/60 p-3 dark:border-sky-900 dark:bg-sky-950/30">
+      <div className="flex flex-wrap items-end gap-3">
+        <label className={`${lbl} min-w-[16rem] flex-1`}>
+          테스트 URL
+          <input
+            type="url"
+            inputMode="url"
+            placeholder={`${apiBase}/lab/video`}
+            value={custom.url}
+            onChange={(e) => set({ url: e.target.value })}
+            className={`${input} font-mono`}
+          />
+        </label>
+        <label className={lbl}>
+          모드
+          <select value={custom.mode} onChange={(e) => set({ mode: e.target.value as CustomMode })} className={input}>
+            <option value="page_load">Page Load — 주기적 새로고침</option>
+            <option value="video">Video Playback — HTML5 video 재생</option>
+          </select>
+        </label>
+        {custom.mode === "page_load" ? (
+          <label className={lbl}>
+            새로고침 간격(초)
+            <input
+              type="number"
+              min={c?.min_reload_s ?? 2}
+              max={3600}
+              step={1}
+              value={custom.reload_interval_s}
+              onChange={(e) => set({ reload_interval_s: Math.max(c?.min_reload_s ?? 2, Number(e.target.value) || 10) })}
+              className={`${input} w-24`}
+            />
+          </label>
+        ) : (
+          <>
+            <label className="flex items-center gap-1.5 pb-2 text-sm">
+              <input type="checkbox" checked={custom.muted} onChange={(e) => set({ muted: e.target.checked })} />
+              Muted
+            </label>
+            <label className="flex items-center gap-1.5 pb-2 text-sm">
+              <input type="checkbox" checked={custom.loop} onChange={(e) => set({ loop: e.target.checked })} />
+              Loop (끝나면 처음부터)
+            </label>
+          </>
+        )}
+        <Btn disabled={!urlLooksOk} onClick={validate}>
+          URL 확인
+        </Btn>
+      </div>
+      {!urlLooksOk && custom.url && <p className="mt-2 text-xs text-rose-700 dark:text-rose-400">http:// 또는 https:// 로 시작하는 URL을 입력하세요.</p>}
+      {check && (
+        <p role="status" className={`mt-2 break-all text-xs ${check.ok ? "text-emerald-700 dark:text-emerald-400" : "text-rose-700 dark:text-rose-400"}`}>
+          {check.text}
+        </p>
+      )}
+      <div className="mt-3 grid gap-3 text-xs leading-relaxed text-slate-600 sm:grid-cols-2 dark:text-slate-300">
+        <div>
+          <b>허용 대상</b>: localhost / 127.0.0.1 (항상)
+          {c && c.allowed_hosts.length > 0 ? ` · ${c.allowed_hosts.join(", ")}` : " · 추가 도메인 없음"}
+          {c && c.resource_hosts.length > 0 && <span> · 리소스 전용: {c.resource_hosts.join(", ")}</span>}
+          <br />
+          도메인 추가: <code>lab.env</code>의 <code>LAB_CUSTOM_ALLOWED_HOSTS</code> 수정 후 백엔드 재시작. YouTube·Twitch·TikTok·치지직 등 외부 미디어/SNS 플랫폼은 등록할 수 없습니다.
+          {c && c.config_problems.length > 0 && (
+            <span className="block text-amber-700 dark:text-amber-400">무시된 allowlist 항목: {c.config_problems.join(" / ")}</span>
+          )}
+          <span className="mt-1 block">
+            로컬 테스트 페이지:{" "}
+            {c &&
+              Object.keys(c.local_test_pages).map((p) => (
+                <button key={p} type="button" className="mr-2 font-mono text-sky-700 underline dark:text-sky-400" onClick={() => set({ url: `${apiBase}${p}` })}>
+                  {p}
+                </button>
+              ))}
+          </span>
+        </div>
+        {c?.require_verification && (
+          <div>
+            <b>외부 도메인 소유권 확인</b>: 테스트 대상 서버의 <code>{c.verification.path}</code> 에 아래 토큰을 넣어 두세요. 첫 실행 때 확인합니다(localhost는 불필요).
+            <div className="mt-1 flex items-center gap-2">
+              <code className="truncate rounded bg-white px-1.5 py-0.5 dark:bg-slate-900">{c.verification.token}</code>
+              <button
+                type="button"
+                className="text-sky-700 underline dark:text-sky-400"
+                onClick={() => {
+                  navigator.clipboard?.writeText(c.verification.token).then(() => setCopied(true));
+                }}
+              >
+                {copied ? "복사됨" : "복사"}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+const VIDEO_STYLE: Record<VideoState, string> = {
+  playing: "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/50 dark:text-emerald-200",
+  paused: "bg-amber-100 text-amber-800 dark:bg-amber-900/50 dark:text-amber-200",
+  ended: "bg-slate-200 text-slate-700 dark:bg-slate-800 dark:text-slate-300",
+  error: "bg-rose-100 text-rose-800 dark:bg-rose-900/50 dark:text-rose-200",
+  none: "bg-slate-200 text-slate-700 dark:bg-slate-800 dark:text-slate-300",
+};
+
+const PAGE_LABEL: Record<Session["page_state"], string> = { idle: "대기", loading: "로딩 중", loaded: "로드됨", error: "오류" };
+
+function fmtSec(v: number | null | undefined) {
+  return v == null ? "—" : `${v.toFixed(1)}s`;
+}
+
+function TargetCell({ s }: { s: Session }) {
+  const url = s.current_url ?? s.target_url;
+  const v = s.video;
+  return (
+    <div className="space-y-0.5">
+      <div className="truncate font-mono text-[11px] text-slate-600 dark:text-slate-300" title={url}>
+        {url.replace(/^https?:\/\//, "")}
+      </div>
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+        <span className={s.page_state === "error" ? "text-rose-600 dark:text-rose-400" : ""}>페이지 {PAGE_LABEL[s.page_state]}</span>
+        <span className="text-slate-500">로드 {s.page_load_count}회</span>
+        {s.custom?.mode === "video" &&
+          (v && v.present ? (
+            <>
+              <span className={`rounded-full px-1.5 py-0.5 text-[11px] font-medium ${VIDEO_STYLE[v.state]}`}>{v.state}</span>
+              <span className="tabular-nums">
+                {fmtSec(v.current_time)} / {fmtSec(v.duration)}
+              </span>
+              <span className="text-slate-500">반복 {v.repeats ?? 0}회</span>
+            </>
+          ) : (
+            <span className="text-slate-500">{v ? "영상 없음" : "영상 확인 전"}</span>
+          ))}
+      </div>
+      {s.last_error && (
+        <div className="truncate text-[11px] text-rose-600 dark:text-rose-400" title={s.last_error}>
+          {s.last_error}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Btn({
   children,
   onClick,
@@ -471,7 +675,7 @@ function Btn({
       title={title}
       onClick={onClick}
       disabled={disabled}
-      className={`${styles} ${small ? "px-2 py-1 text-xs" : "px-3 py-1.5 text-sm"} rounded-md font-medium transition disabled:cursor-not-allowed disabled:opacity-40`}
+      className={`${styles} ${small ? "px-2 py-1 text-xs" : "px-3 py-1.5 text-sm"} whitespace-nowrap rounded-md font-medium transition disabled:cursor-not-allowed disabled:opacity-40`}
     >
       {children}
     </button>
@@ -509,12 +713,13 @@ function SessionTable({ sessions, busy, run }: { sessions: Session[]; busy: stri
         <p className="px-4 py-10 text-center text-sm text-slate-500">등록된 세션이 없습니다. 위에서 세션을 등록하세요.</p>
       ) : (
         <div className="max-h-[520px] overflow-auto">
-          <table className="w-full min-w-[900px] text-sm">
+          <table className="w-full min-w-[1200px] text-sm">
             <thead className="sticky top-0 bg-slate-50 text-left text-xs text-slate-500 dark:bg-slate-900 dark:text-slate-400">
               <tr>
                 <th className="px-4 py-2 font-medium">세션</th>
                 <th className="px-2 py-2 font-medium">상태</th>
                 <th className="px-2 py-2 font-medium">시나리오</th>
+                <th className="px-2 py-2 font-medium">대상 · 페이지 / 영상</th>
                 <th className="px-2 py-2 text-right font-medium">실행시간</th>
                 <th className="px-2 py-2 text-right font-medium">반복</th>
                 <th className="px-2 py-2 text-right font-medium">최근 로딩</th>
@@ -536,11 +741,17 @@ function SessionTable({ sessions, busy, run }: { sessions: Session[]; busy: stri
                       <div className="font-mono text-[11px] text-slate-500">{s.id}</div>
                     </td>
                     <td className="px-2 py-2">
-                      <span className={`inline-block rounded-full px-2 py-0.5 text-xs font-medium ${STATUS_STYLE[s.status]}`} title={s.last_error ?? undefined}>
+                      <span className={`inline-block whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-medium ${STATUS_STYLE[s.status]}`} title={s.last_error ?? undefined}>
                         {STATUS_LABEL[s.status]}
                       </span>
                     </td>
-                    <td className="px-2 py-2 font-mono text-xs">{s.scenario}</td>
+                    <td className="px-2 py-2 font-mono text-xs">
+                      {s.scenario}
+                      {s.custom && <div className="text-[11px] text-slate-500">{s.custom.mode === "video" ? "video" : `reload ${s.custom.reload_interval_s}s`}</div>}
+                    </td>
+                    <td className="max-w-[20rem] px-2 py-2 text-xs">
+                      <TargetCell s={s} />
+                    </td>
                     <td className="px-2 py-2 text-right tabular-nums">{fmtDuration(s.uptime_s)}</td>
                     <td className="px-2 py-2 text-right tabular-nums">{s.iterations}</td>
                     <td className="px-2 py-2 text-right tabular-nums">{fmtMs(s.last_load_ms)}</td>

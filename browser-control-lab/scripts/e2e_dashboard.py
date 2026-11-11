@@ -124,6 +124,42 @@ def main() -> int:
         page.get_by_role("button", name="전체 삭제").click()
         wait(lambda s: s["summary"]["total"] == 0, msg="delete-all")
         print("✓ delete-all")
+
+        # ---- custom URL scenario
+        expect(page.get_by_text("현재 등록 0개")).to_be_visible()  # UI caught up with delete-all
+        page.get_by_label("테스트 시나리오").select_option("custom")
+        url_box = page.get_by_label("테스트 URL")
+        expect(url_box).to_be_visible()
+        url_box.fill("https://www.youtube.com/watch?v=abc")
+        page.get_by_label("세션 수").fill("2")
+        page.get_by_role("button", name="세션 등록").click()
+        expect(page.get_by_text("third-party media/social platform")).to_be_visible()
+        assert state()["summary"]["total"] == 0
+        print("✓ custom: YouTube URL refused by the backend, error shown, nothing registered")
+
+        url_box.fill(f"{API}/lab/video")
+        page.get_by_label("모드").select_option("video")
+        expect(page.get_by_label("Muted")).to_be_checked()
+        page.get_by_role("button", name="URL 확인").click()
+        expect(page.get_by_text("허용됨 (localhost)")).to_be_visible()
+        page.get_by_role("button", name="세션 등록").click()
+        wait(lambda s: s["summary"]["total"] == 2, msg="custom register")
+        page.get_by_role("button", name="전체 시작").click()
+        st = wait(lambda s: all((x["video"] or {}).get("repeats", 0) >= 1 for x in s["sessions"]),
+                  msg="custom video repeats", timeout=60)
+        expect(page.get_by_text("반복 1회").first.or_(page.get_by_text("반복 2회").first)).to_be_visible()
+        v = st["sessions"][0]["video"]
+        print(f"✓ custom video: 2 sessions playing, state={v['state']} t={v['current_time']}/{v['duration']}s "
+              f"repeats={v['repeats']}")
+        time.sleep(1)
+        page.screenshot(path=str(shots / "dashboard-custom-video.png"), full_page=True)
+        page.get_by_role("button", name="전체 중지").click()
+        wait(lambda s: s["summary"]["running"] == 0 and s["system"]["lab_process_count"] == 0, msg="custom stop-all")
+        with urllib.request.urlopen(f"{API}/api/processes") as r:
+            assert json.load(r)["count"] == 0
+        print("✓ custom stop-all: 0 browser processes")
+        page.get_by_role("button", name="전체 삭제").click()
+        wait(lambda s: s["summary"]["total"] == 0, msg="delete-all 2")
         browser.close()
     print("E2E PASSED")
     return 0

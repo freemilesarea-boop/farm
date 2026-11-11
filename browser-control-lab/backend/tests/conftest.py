@@ -16,3 +16,12 @@ os.environ["LAB_MAX_SESSIONS"] = "100"
 os.environ["LAB_CPU_THRESHOLD"] = "101"
 os.environ["LAB_RAM_THRESHOLD"] = "85"
 os.environ["LAB_PRESSURE_BLOCK_LEVEL"] = "warn"
+# Custom-URL policy for tests: a fake allow-listed host pinned to 127.0.0.1 (needs the
+# private-network opt-in) plus a resource-only host. Ownership verification is enabled
+# explicitly in the tests that cover it.
+os.environ["LAB_CUSTOM_ALLOWED_HOSTS"] = "allowed.test"
+os.environ["LAB_CUSTOM_RESOURCE_HOSTS"] = "cdn.allowed.test"
+os.environ["LAB_CUSTOM_HOST_OVERRIDES"] = "allowed.test=127.0.0.1,cdn.allowed.test=127.0.0.1"
+os.environ["LAB_CUSTOM_ALLOW_PRIVATE_NETWORK"] = "1"
+os.environ["LAB_CUSTOM_REQUIRE_VERIFICATION"] = "0"
+os.environ["LAB_CUSTOM_MIN_RELOAD_S"] = "1"

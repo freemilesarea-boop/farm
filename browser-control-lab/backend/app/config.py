@@ -96,6 +96,15 @@ class Settings:
         default_factory=lambda: frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
     )
 
+    # ---- custom URL scenario (see app/custom_target.py and README "Custom URL")
+    custom_allowed_hosts: str = os.environ.get("LAB_CUSTOM_ALLOWED_HOSTS", "")
+    custom_resource_hosts: str = os.environ.get("LAB_CUSTOM_RESOURCE_HOSTS", "")
+    custom_allow_private_network: bool = os.environ.get("LAB_CUSTOM_ALLOW_PRIVATE_NETWORK", "0") == "1"
+    custom_require_verification: bool = os.environ.get("LAB_CUSTOM_REQUIRE_VERIFICATION", "1") != "0"
+    custom_host_overrides: str = os.environ.get("LAB_CUSTOM_HOST_OVERRIDES", "")
+    # Bounds for user-chosen reload interval (seconds)
+    custom_min_reload_s: float = _env_float("LAB_CUSTOM_MIN_RELOAD_S", 2.0)
+
     cors_origins: tuple[str, ...] = tuple(
         o.strip()
         for o in os.environ.get(
@@ -105,8 +114,29 @@ class Settings:
     )
 
     @property
+    def custom_policy(self):
+        from .custom_target import CustomPolicy
+        return _policy_cache(self.custom_allowed_hosts, self.custom_resource_hosts,
+                             self.custom_allow_private_network, self.custom_require_verification,
+                             self.custom_host_overrides)
+
+    @property
+    def verification_token(self) -> str:
+        from .custom_target import load_or_create_token
+        return load_or_create_token(self.db_path.parent / "verification_token.txt")
+
+    @property
     def test_base_url(self) -> str:
         return f"http://127.0.0.1:{self.port}/lab"
+
+
+from functools import lru_cache  # noqa: E402
+
+
+@lru_cache(maxsize=8)
+def _policy_cache(allowed: str, resources: str, allow_private: bool, require_verification: bool, overrides: str):
+    from .custom_target import CustomPolicy
+    return CustomPolicy.from_strings(allowed, resources, allow_private, require_verification, overrides)
 
 
 # Command-line marker added to every Chromium we launch, so that our own browser

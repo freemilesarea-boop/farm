@@ -103,3 +103,23 @@ def test_repo_lab_env_value():
             k, _, v = line.partition("=")
             values[k.strip()] = v.strip()
     assert values == {"LAB_MAX_CONCURRENT": "100"}  # only the concurrency limit is set there
+
+
+def test_db_migration_adds_config_column(tmp_path):
+    """An existing pre-custom database (e.g. on the Mac mini) is migrated in place."""
+    import sqlite3
+
+    from app.db import Database
+    path = tmp_path / "old.sqlite3"
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, name TEXT NOT NULL, scenario TEXT NOT NULL, "
+                "created_at REAL NOT NULL, last_status TEXT NOT NULL DEFAULT 'idle')")
+    con.execute("INSERT INTO sessions VALUES ('abc', 'session-001', 'basic', 1.0, 'idle')")
+    con.commit()
+    con.close()
+    db = Database(path)
+    rows = db.list_sessions()
+    assert rows[0]["id"] == "abc" and rows[0]["config"] is None
+    db.insert_session("def", "session-002", "custom", 2.0, {"url": "http://localhost/", "mode": "video"})
+    assert db.list_sessions()[1]["config"]["mode"] == "video"
+    db.close()

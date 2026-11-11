@@ -2,7 +2,45 @@ export const API_URL = (process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:800
 export const WS_URL = API_URL.replace(/^http/, "ws") + "/ws";
 
 export type SessionStatus = "idle" | "starting" | "running" | "stopping" | "stopped" | "error";
-export type Scenario = "basic" | "heavy" | "slow" | "flaky" | "error";
+export type Scenario = "basic" | "heavy" | "slow" | "flaky" | "error" | "custom";
+
+export type CustomMode = "page_load" | "video";
+
+export interface CustomConfig {
+  url: string;
+  mode: CustomMode;
+  reload_interval_s: number;
+  muted: boolean;
+  loop: boolean;
+}
+
+export type VideoState = "playing" | "paused" | "ended" | "error" | "none";
+
+export interface VideoStatus {
+  present: boolean;
+  state: VideoState;
+  current_time?: number;
+  duration?: number | null;
+  repeats?: number;
+  muted?: boolean;
+  loop?: boolean;
+}
+
+export interface LabConfig {
+  max_sessions: number;
+  max_concurrent: number;
+  custom: {
+    allowed_hosts: string[];
+    resource_hosts: string[];
+    allow_private_network: boolean;
+    require_verification: boolean;
+    config_problems: string[];
+    blocked_platform_examples: string[];
+    min_reload_s: number;
+    verification: { path: string; token: string };
+    local_test_pages: Record<string, string>;
+  };
+}
 
 export interface Session {
   id: string;
@@ -27,6 +65,11 @@ export interface Session {
   memory_rss_mb: number | null;
   memory_method: string | null;
   process_count: number;
+  custom: CustomConfig | null;
+  current_url: string | null;
+  page_state: "idle" | "loading" | "loaded" | "error";
+  page_load_count: number;
+  video: VideoStatus | null;
 }
 
 export interface LogEntry {

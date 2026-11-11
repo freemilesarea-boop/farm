@@ -22,6 +22,7 @@ from .db import Database
 from .procs import (alive_tracked, describe, find_lab_processes, kill_lab_processes, kill_tracked,
                     snapshot_pids)
 from .sysmem import PRESSURE_ORDER, MemoryReader, MemorySnapshot, process_memory
+from .custom_target import CustomURLError, ValidatedTarget
 from .security import assert_local_url, is_local_url, redact
 from .testpages import SCENARIOS
 
@@ -44,6 +45,35 @@ LOCAL_ONLY_BROWSER_ARGS = [
     "--no-pings",
 ]
 MAX_CONSECUTIVE_FAILURES = 5
+VIDEO_POLL_S = 1.0
+VIDEO_FIND_TIMEOUT_MS = 10_000
+
+# --- injected into custom Video Playback pages (only plain HTML5 <video> elements) ---
+VIDEO_INSTALL_JS = """(opts) => {
+  const v = document.querySelector('video');
+  if (!v) return {present: false};
+  if (!window.__blc) {
+    const b = window.__blc = {repeats: 0, errors: [], loop: !!opts.loop};
+    v.addEventListener('ended', () => {
+      b.repeats++;
+      if (b.loop) { v.currentTime = 0; v.play().catch(e => b.errors.push('replay failed: ' + e.name + ': ' + e.message)); }
+    });
+    v.addEventListener('error', () => b.errors.push('media error ' + (v.error ? v.error.code + ' ' + (v.error.message || '') : '')));
+  }
+  window.__blc.loop = !!opts.loop;
+  v.muted = !!opts.muted;
+  return v.play().then(() => ({present: true, started: true}))
+                 .catch(e => ({present: true, started: false, error: e.name + ': ' + e.message}));
+}"""
+VIDEO_STATUS_JS = """() => {
+  const v = document.querySelector('video');
+  if (!v) return {present: false};
+  const b = window.__blc;
+  const state = v.error ? 'error' : v.ended ? 'ended' : (!v.paused ? 'playing' : 'paused');
+  return {present: true, installed: !!b, state, current_time: v.currentTime,
+          duration: isFinite(v.duration) ? v.duration : null, repeats: b ? b.repeats : 0,
+          errors: b ? b.errors.splice(0) : [], muted: v.muted};
+}"""
 
 
 class LimitError(RuntimeError):
@@ -76,6 +106,14 @@ class TestSession:
     tracked: set = field(default_factory=set, repr=False)  # {(pid, create_time)} ever seen
     run_id: int | None = None
     crashed: bool = False
+    # ---- custom URL scenario
+    custom: dict | None = None            # {url, mode, reload_interval_s, muted, loop}
+    target: ValidatedTarget | None = field(default=None, repr=False)
+    current_url: str | None = None
+    page_state: str = "idle"              # idle | loading | loaded | error
+    page_load_count: int = 0
+    video: dict = field(default_factory=dict)
+    last_blocked_url: str | None = None
     # runtime handles (not serialised)
     task: asyncio.Task | None = field(default=None, repr=False)
     stop_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
@@ -87,6 +125,8 @@ class TestSession:
 
     @property
     def target_url(self) -> str:
+        if self.custom:
+            return self.custom["url"]
         return f"http://127.0.0.1:{settings.port}{SCENARIOS[self.scenario]['path']}"
 
     @property
@@ -117,6 +157,11 @@ class TestSession:
             "isolation_ok": self.isolation_ok,
             "blocked_requests": self.blocked_requests,
             "last_error": self.last_error,
+            "custom": self.custom,
+            "current_url": self.current_url,
+            "page_state": self.page_state,
+            "page_load_count": self.page_load_count,
+            "video": self.video or None,
             "memory_mb": self.memory_mb,
             "memory_rss_mb": self.memory_rss_mb,
             "memory_method": self.memory_method,
@@ -178,6 +223,7 @@ class SessionManager:
         self._launch_sem = asyncio.Semaphore(3)  # avoid launching many Chromiums at once
         self._sampler: asyncio.Task | None = None
         self._lock = asyncio.Lock()  # guards admission decisions
+        self._verified_origins: dict[str, float] = {}
 
     # ------------------------------------------------------------------ lifecycle
     async def startup(self) -> None:
@@ -190,12 +236,16 @@ class SessionManager:
             self.db.log("warning", "Recovered from unclean shutdown",
                         data={"sessions_reset": recovered, "orphan_processes_killed": killed})
         for row in self.db.list_sessions():
-            if row["scenario"] not in SCENARIOS:
+            if row["scenario"] not in SCENARIOS and not (row["scenario"] == "custom" and row["config"]):
                 continue
             self.sessions[row["id"]] = TestSession(
                 id=row["id"], name=row["name"], scenario=row["scenario"], created_at=row["created_at"],
                 status="idle" if row["last_status"] in ACTIVE_STATES else row["last_status"],
+                custom=row["config"] if row["scenario"] == "custom" else None,
             )
+        pol = settings.custom_policy
+        for problem in pol.config_problems:
+            self.db.log("warning", f"Custom URL allowlist entry ignored: {problem}")
         self._sampler = asyncio.create_task(self._sample_loop())
         self.db.log("info", "Server started",
                     data={"sessions_loaded": len(self.sessions), "max_concurrent": settings.max_concurrent})
@@ -263,9 +313,16 @@ class SessionManager:
         s.memory_mb, s.memory_rss_mb, s.memory_method = mem["uss_mb"], mem["rss_mb"], mem["method"]
 
     # ------------------------------------------------------------------ registry
-    def create_sessions(self, count: int, scenario: str, name_prefix: str | None = None) -> list[TestSession]:
-        if scenario not in SCENARIOS:
+    def create_sessions(self, count: int, scenario: str, name_prefix: str | None = None,
+                        custom: dict | None = None) -> list[TestSession]:
+        """``custom`` must already be validated (see main.create_sessions); it is re-validated at start."""
+        if scenario == "custom":
+            if not custom or not custom.get("url"):
+                raise ValueError("custom scenario requires a URL")
+        elif scenario not in SCENARIOS:
             raise ValueError(f"Unknown scenario {scenario!r}")
+        else:
+            custom = None
         if count < 1:
             raise ValueError("count must be >= 1")
         if len(self.sessions) + count > settings.max_sessions:
@@ -277,11 +334,12 @@ class SessionManager:
             sid = uuid.uuid4().hex[:10]
             n = len(self.sessions) + 1
             s = TestSession(id=sid, name=f"{name_prefix or 'session'}-{n:03d}", scenario=scenario,
-                            created_at=time.time())
+                            created_at=time.time(), custom=dict(custom) if custom else None)
             self.sessions[sid] = s
-            self.db.insert_session(s.id, s.name, s.scenario, s.created_at)
+            self.db.insert_session(s.id, s.name, s.scenario, s.created_at, s.custom)
             created.append(s)
-        self.db.log("info", f"Registered {count} session(s)", data={"scenario": scenario})
+        self.db.log("info", f"Registered {count} session(s)",
+                    data={"scenario": scenario, **({"url": custom["url"], "mode": custom["mode"]} if custom else {})})
         return created
 
     def get(self, sid: str) -> TestSession:
@@ -331,7 +389,11 @@ class SessionManager:
             if reason:
                 self.db.log("warning", f"Start blocked: {reason}", session_id=sid)
                 raise LimitError(reason)
-            assert_local_url(s.target_url)
+            if s.custom:
+                # Re-validate at every start (allowlist may have changed; DNS re-checked).
+                s.target = settings.custom_policy.validate(s.custom["url"])
+            else:
+                assert_local_url(s.target_url)
             self._reset_metrics(s)
             s.status = "starting"
             s.started_at = time.time()
@@ -440,6 +502,11 @@ class SessionManager:
         s.isolation_ok = None
         s.last_error = None
         s.crashed = False
+        s.current_url = None
+        s.page_state = "idle"
+        s.page_load_count = 0
+        s.video = {}
+        s.last_blocked_url = None
 
     def _record_error(self, s: TestSession, message: str) -> None:
         s.errors += 1
@@ -458,11 +525,13 @@ class SessionManager:
                 s.browser = await pw.chromium.launch(
                     headless=settings.headless,
                     executable_path=settings.chromium_executable,
-                    args=[f"{PROCESS_MARKER}={s.marker}", *LOCAL_ONLY_BROWSER_ARGS],
+                    args=[f"{PROCESS_MARKER}={s.marker}", *self._browser_args(s)],
                 )
             s.browser.on("disconnected", lambda _b: self._on_disconnect(s))
             context = await s.browser.new_context(viewport={"width": 1280, "height": 800})
             await context.route("**/*", lambda route: self._guard_route(s, route))
+            if s.custom:
+                context.on("requestfailed", lambda req: self._on_request_failed(s, req))
             page = await context.new_page()
             page.set_default_timeout(settings.page_timeout_ms)
             if not s.stop_event.is_set():
@@ -470,8 +539,15 @@ class SessionManager:
                 self.db.set_session_status(s.id, s.status)
             self.db.log("info", f"{s.name} running (browser {s.browser.version})", session_id=s.id)
 
+            if s.custom and not await self._verify_ownership(s, page):
+                end_reason = "error"
+                s.stop_event.set()
+
             while not s.stop_event.is_set():
-                await self._iteration(s, page)
+                if s.custom and s.custom["mode"] == "video":
+                    await self._video_cycle(s, page)
+                else:
+                    await self._iteration(s, page)
                 if s.consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                     end_reason = "error"
                     self.db.log("error", f"{s.name}: {MAX_CONSECUTIVE_FAILURES} consecutive failures, stopping",
@@ -480,8 +556,9 @@ class SessionManager:
                 if s.browser is None or not s.browser.is_connected():
                     end_reason = "error"
                     break
+                interval = (float(s.custom["reload_interval_s"]) if s.custom else settings.iteration_interval)
                 try:
-                    await asyncio.wait_for(s.stop_event.wait(), timeout=settings.iteration_interval)
+                    await asyncio.wait_for(s.stop_event.wait(), timeout=interval)
                 except asyncio.TimeoutError:
                     pass
             if s.crashed:
@@ -507,26 +584,69 @@ class SessionManager:
             self._record_error(s, "Browser disconnected unexpectedly")
             s.stop_event.set()
 
+    @staticmethod
+    def _browser_args(s: TestSession) -> list[str]:
+        if not s.custom:
+            return list(LOCAL_ONLY_BROWSER_ARGS)
+        # Same lockdown, but allow-listed hosts are pinned to their validated IPs.
+        pol = settings.custom_policy
+        rules = pol.resolver_rules()
+        args = [a if not a.startswith("--host-resolver-rules=") else f"--host-resolver-rules={rules}"
+                for a in LOCAL_ONLY_BROWSER_ARGS if a != "--no-proxy-server"]
+        args += pol.proxy_args()
+        if s.custom["mode"] == "video":
+            args.append("--autoplay-policy=no-user-gesture-required")
+        return args
+
+    _NET_BLOCK_ERRORS = ("ERR_NAME_NOT_RESOLVED", "ERR_PROXY_CONNECTION_FAILED", "ERR_TUNNEL_CONNECTION_FAILED",
+                         "ERR_BLOCKED_BY_CLIENT")
+
+    def _on_request_failed(self, s: TestSession, req) -> None:
+        """Requests stopped by the network-level policy (redirect hops, IP literals) never reach the
+        route guard, so log them here with their URL."""
+        err = req.failure or ""
+        if any(e in err for e in self._NET_BLOCK_ERRORS) and not settings.custom_policy.host_allowed(
+                req.url, navigation=False):
+            s.blocked_requests += 1
+            s.last_blocked_url = req.url[:200]
+            self.db.log("warning", f"Blocked by network policy ({err}): {req.url[:200]}", session_id=s.id)
+
     async def _guard_route(self, s: TestSession, route: Route) -> None:
-        url = route.request.url
-        if is_local_url(url):
+        req = route.request
+        url = req.url
+        if s.custom:
+            try:
+                main_nav = req.is_navigation_request() and req.frame.parent_frame is None
+            except Exception:
+                main_nav = False
+            ok = settings.custom_policy.host_allowed(url, navigation=main_nav)
+        else:
+            ok = is_local_url(url)
+        if ok:
             await route.continue_()
         else:
             s.blocked_requests += 1
-            self.db.log("warning", f"Blocked non-local request to {url[:200]}", session_id=s.id)
+            kind = "redirect/navigation" if req.is_navigation_request() else "request"
+            self.db.log("warning", f"Blocked {kind} to non-allowed host: {url[:200]}", session_id=s.id)
             await route.abort("blockedbyclient")
 
-    async def _iteration(self, s: TestSession, page: Page) -> None:
+    async def _iteration(self, s: TestSession, page: Page) -> bool:
+        """One page load. Returns True on success."""
         s.iterations += 1
+        s.page_state = "loading"
         t0 = time.perf_counter()
         try:
             resp = await page.goto(s.target_url, wait_until="load")
             elapsed = (time.perf_counter() - t0) * 1000
+            s.current_url = page.url
             status = resp.status if resp else 0
+            if s.custom and not self._final_url_ok(s, page, resp):
+                return False
             if status >= 400 or status == 0:
+                s.page_state = "error"
                 self._record_error(s, f"HTTP {status} from {s.target_url}")
                 s.last_load_ms = round(elapsed, 1)
-                return
+                return False
             timing = await page.evaluate(
                 """() => { const n = performance.getEntriesByType('navigation')[0];
                            return n ? {ttfb: n.responseStart - n.requestStart, load: n.loadEventEnd - n.startTime} : null; }"""
@@ -535,12 +655,133 @@ class SessionManager:
             s.last_ttfb_ms = round(timing["ttfb"], 1) if timing else None
             s.total_load_ms += elapsed
             s.ok_iterations += 1
-            await self._check_isolation(s, page)
-            s.consecutive_failures = 0
+            s.page_load_count += 1
+            s.page_state = "loaded"
+            if s.custom:
+                await self._check_storage_isolation(s, page)
+            else:
+                await self._check_isolation(s, page)
+            if not (s.custom and s.custom["mode"] == "video"):
+                s.consecutive_failures = 0  # video mode resets only once playback runs
+            return True
         except Exception as exc:
             if s.stop_event.is_set():
-                return  # navigation interrupted by shutdown; not a test failure
-            self._record_error(s, f"{type(exc).__name__}: {str(exc).splitlines()[0] if str(exc) else ''}")
+                return False  # navigation interrupted by shutdown; not a test failure
+            s.page_state = "error"
+            msg = str(exc).splitlines()[0] if str(exc) else ""
+            if s.custom and any(e in msg for e in self._NET_BLOCK_ERRORS):
+                blocked = f" ({s.last_blocked_url})" if s.last_blocked_url else ""
+                msg = (f"Blocked: the page or a redirect tried to reach a host that is not allowed{blocked}. "
+                       + msg)
+            self._record_error(s, f"{type(exc).__name__}: {msg}")
+            return False
+
+    def _final_url_ok(self, s: TestSession, page: Page, resp) -> bool:
+        """Defence in depth: re-check every redirect hop and the final URL against the policy."""
+        pol = settings.custom_policy
+        hops = []
+        req = resp.request if resp else None
+        while req is not None:
+            hops.append(req.url)
+            req = req.redirected_from
+        for u in [page.url, *hops]:
+            if not pol.host_allowed(u, navigation=True):
+                s.page_state = "error"
+                self._record_error(s, f"Redirect left the allowlist: {u[:200]} (navigation refused)")
+                return False
+        return True
+
+    async def _verify_ownership(self, s: TestSession, page: Page) -> bool:
+        """Non-local custom targets must serve this lab's token at /.well-known/blc-lab-verify.txt."""
+        tgt = s.target
+        if tgt is None or tgt.local or not settings.custom_policy.require_verification:
+            return True
+        cached = self._verified_origins.get(tgt.origin)
+        if cached and time.time() - cached < 3600:
+            return True
+        token = settings.verification_token
+        why = None
+        try:
+            resp = await page.goto(tgt.verify_url, wait_until="load")
+            if resp is None or resp.status != 200:
+                why = f"HTTP {resp.status if resp else 0}"
+            elif resp.request.redirected_from is not None or page.url != tgt.verify_url:
+                why = "the verification URL redirected (not allowed)"
+            elif token not in (await resp.text())[:4096]:
+                why = "the file does not contain this lab's token"
+        except Exception as exc:
+            why = (str(exc).splitlines() or [type(exc).__name__])[0]
+        if why:
+            s.page_state = "error"
+            self._record_error(s, f"Ownership verification failed for {tgt.origin}: {why}. Serve the token shown "
+                                  f"in the dashboard at {tgt.verify_url} (or test on localhost).")
+            return False
+        self._verified_origins[tgt.origin] = time.time()
+        self.db.log("info", f"Ownership verified for {tgt.origin}", session_id=s.id)
+        return True
+
+    async def _video_cycle(self, s: TestSession, page: Page) -> None:
+        """Load the page, start the first HTML5 <video>, then poll its state until stop or failure."""
+        if not await self._iteration(s, page):
+            return
+        opts = {"muted": bool(s.custom.get("muted", True)), "loop": bool(s.custom.get("loop", True))}
+        try:
+            await page.wait_for_selector("video", state="attached", timeout=VIDEO_FIND_TIMEOUT_MS)
+        except Exception:
+            s.video = {"present": False, "state": "none"}
+            self._record_error(s, "No HTML5 <video> element found on the page")
+            return
+        res = await page.evaluate(VIDEO_INSTALL_JS, opts)
+        if not res.get("present"):
+            s.video = {"present": False, "state": "none"}
+            self._record_error(s, "No HTML5 <video> element found on the page")
+            return
+        if not res.get("started"):
+            s.video = {"present": True, "state": "error", "repeats": 0}
+            self._record_error(s, f"Video playback failed to start: {res.get('error')}")
+            return
+        self.db.log("info", f"{s.name}: video playback started (muted={opts['muted']}, loop={opts['loop']})",
+                    session_id=s.id)
+        while not s.stop_event.is_set():
+            try:
+                st = await page.evaluate(VIDEO_STATUS_JS)
+            except Exception as exc:
+                if s.stop_event.is_set():
+                    return
+                self._record_error(s, f"Lost the page while playing: {(str(exc).splitlines() or [''])[0]}")
+                return  # outer loop reloads after the interval
+            if not st.get("present") or not st.get("installed"):
+                self._record_error(s, "Video element disappeared or the page navigated away")
+                return
+            s.video = {"present": True, "state": st["state"], "current_time": round(st["current_time"], 2),
+                       "duration": round(st["duration"], 2) if st.get("duration") else None,
+                       "repeats": st["repeats"], "muted": st["muted"], "loop": opts["loop"]}
+            for err in st.get("errors", []):
+                self._record_error(s, f"Video: {err}")
+            if st["state"] == "error":
+                return
+            if st["state"] == "playing":
+                s.consecutive_failures = 0
+            try:
+                await asyncio.wait_for(s.stop_event.wait(), timeout=VIDEO_POLL_S)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _check_storage_isolation(self, s: TestSession, page: Page) -> None:
+        """Custom targets may be any allowed origin, so only localStorage is checked (no lab endpoint)."""
+        try:
+            result = await page.evaluate(
+                """(sid) => { try { const k = '__blc_lab_sid'; const before = localStorage.getItem(k);
+                     if (!before) localStorage.setItem(k, sid);
+                     return {before, now: localStorage.getItem(k)}; } catch (e) { return null; } }""", s.id)
+        except Exception:
+            result = None
+        if result is None:
+            return  # storage unavailable on this page (e.g. sandboxed); not a failure
+        ok = result["now"] == s.id and result["before"] in (None, s.id)
+        if not ok and s.isolation_ok is not False:
+            self.db.log("error", "Isolation check failed", session_id=s.id, data=result)
+        s.isolation_ok = ok
 
     async def _check_isolation(self, s: TestSession, page: Page) -> None:
         """Each session writes its own id to localStorage + a cookie and must only ever read back its own."""

@@ -12,10 +12,21 @@ from pydantic import BaseModel, Field
 from .config import settings
 from .db import Database
 from .session_manager import LimitError, SessionManager
-from .testpages import SCENARIOS
+from .custom_target import VERIFY_PATH, CustomURLError
+from .security import URLNotAllowed
+from .testpages import LOCAL_EXTRA_PAGES, SCENARIOS
 from .testpages import router as testpages_router
 
-Scenario = Literal["basic", "heavy", "slow", "flaky", "error"]
+Scenario = Literal["basic", "heavy", "slow", "flaky", "error", "custom"]
+
+
+class CustomTarget(BaseModel):
+    """User-supplied target. Always validated by the backend (custom_target.CustomPolicy)."""
+    url: str = Field(..., min_length=1, max_length=2048)
+    mode: Literal["page_load", "video"] = "page_load"
+    reload_interval_s: float = Field(10.0, le=3600)
+    muted: bool = True
+    loop: bool = True
 
 
 class CreateSessions(BaseModel):
@@ -24,6 +35,26 @@ class CreateSessions(BaseModel):
     name_prefix: str | None = Field(None, max_length=40, pattern=r"^[A-Za-z0-9_\-]*$")
     # True: stop and delete every existing session first, so the lab holds exactly `count`.
     replace: bool = False
+    # Required when scenario == "custom"; ignored otherwise.
+    custom: CustomTarget | None = None
+
+
+class ValidateURL(BaseModel):
+    url: str = Field(..., max_length=4096)
+
+
+def _validated_custom(body: CreateSessions) -> dict | None:
+    if body.scenario != "custom":
+        return None
+    if body.custom is None:
+        raise HTTPException(status_code=400, detail="scenario 'custom' requires a 'custom' object with a URL")
+    try:
+        target = settings.custom_policy.validate(body.custom.url)
+    except CustomURLError as exc:
+        raise HTTPException(status_code=400, detail=f"URL not allowed: {exc}")
+    interval = max(settings.custom_min_reload_s, body.custom.reload_interval_s)
+    return {"url": target.url, "mode": body.custom.mode, "reload_interval_s": interval,
+            "muted": body.custom.muted, "loop": body.custom.loop}
 
 
 db = Database(settings.db_path)
@@ -68,7 +99,25 @@ async def get_config():
         "pressure_block_level": settings.pressure_block_level,
         "iteration_interval": settings.iteration_interval,
         "scenarios": SCENARIOS,
+        "custom": {
+            **settings.custom_policy.to_dict(),
+            "min_reload_s": settings.custom_min_reload_s,
+            "verification": {"path": VERIFY_PATH, "token": settings.verification_token},
+            "local_test_pages": LOCAL_EXTRA_PAGES,
+        },
     }
+
+
+@app.post("/api/custom/validate")
+async def validate_custom_url(body: ValidateURL):
+    """Backend check of a custom URL (same rules the session uses). Never fetches the URL."""
+    try:
+        t = settings.custom_policy.validate(body.url)
+    except CustomURLError as exc:
+        raise HTTPException(status_code=400, detail=f"URL not allowed: {exc}")
+    return {"ok": True, "url": t.url, "host": t.host, "local": t.local, "resolved_ips": t.ips,
+            "verification_required": (not t.local) and settings.custom_policy.require_verification,
+            "verify_url": None if t.local else t.verify_url}
 
 
 @app.get("/api/state")
@@ -83,12 +132,13 @@ async def list_sessions():
 
 @app.post("/api/sessions", status_code=201)
 async def create_sessions(body: CreateSessions):
+    custom = _validated_custom(body)  # validate before touching existing sessions
     if body.replace:
         await manager.stop_all(reason="replace")
         for sid in list(manager.sessions):
             await manager.delete_session(sid)
     try:
-        created = manager.create_sessions(body.count, body.scenario, body.name_prefix)
+        created = manager.create_sessions(body.count, body.scenario, body.name_prefix, custom=custom)
     except LimitError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     return [s.to_dict() for s in created]
@@ -118,6 +168,8 @@ async def _control(action: str, sid: str):
         raise _not_found(exc)
     except LimitError as exc:
         raise HTTPException(status_code=429, detail=str(exc))
+    except (CustomURLError, URLNotAllowed) as exc:
+        raise HTTPException(status_code=400, detail=f"URL not allowed: {exc}")
     return s.to_dict()
 
 

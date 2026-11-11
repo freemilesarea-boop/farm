@@ -4,6 +4,7 @@ macOS 로컬 환경에서 Playwright 기반 Chromium 테스트 세션을 만들�
 테스트 대상은 **이 서버가 직접 제공하는 localhost 테스트 페이지로 한정**됩니다.
 
 > 범위 밖(구현하지 않음): 외부 서비스 조회수·시청시간·추천 알고리즘 조작, 계정 로그인 자동화, 탐지 회피, 임의 외부 URL 호출.
+> `custom` 시나리오는 **본인이 소유하거나 테스트 권한이 있는 대상**에만 동작합니다. localhost는 항상 허용하고, 외부 도메인은 allowlist 등록과 소유권 확인을 모두 거쳐야 합니다. 외부 미디어/SNS 플랫폼은 항상 차단합니다. 자세한 내용은 [사용자 지정 URL 테스트](#사용자-지정-url-테스트)를 참고하세요.
 
 ## 구성
 
@@ -92,6 +93,103 @@ cd frontend && npm run dev
    - **테스트 브라우저 메모리**: 브라우저 USS 합계, 전체 RAM 대비 %, RSS 합계(비교용), 나머지 시스템 사용량, 백엔드 서버 RSS
    - **메모리 압력 · Swap**: 압력 등급, Swap 사용량, Swap in/out 속도, 압축 메모리
 
+## 사용자 지정 URL 테스트
+
+대시보드의 테스트 시나리오에서 `custom — 사용자 지정 URL`을 선택하면 설정 패널이 열립니다.
+
+| 항목 | 설명 |
+|---|---|
+| 테스트 URL | `http://` 또는 `https://` URL만 입력할 수 있습니다. 예: `http://127.0.0.1:8000/lab/video` |
+| 모드 | **Page Load**: URL을 열고, 지정한 간격마다 다시 로드합니다. **Video Playback**: 페이지 로드 후 첫 번째 HTML5 `<video>`를 찾아 재생합니다. |
+| 새로고침 간격(초) | Page Load 전용. 최소 `LAB_CUSTOM_MIN_RELOAD_S`(기본 2초) |
+| Muted / Loop | Video Playback 전용. Loop를 켜면 영상이 끝날 때마다 처음부터 다시 재생하고 반복 횟수를 셉니다. 끄면 한 번 재생 후 `ended` 상태로 유지됩니다. |
+| URL 확인 | 백엔드가 같은 규칙으로 URL을 검사해 결과를 보여줍니다. URL에 실제로 접속하지는 않습니다. |
+
+이후 세션 수를 정하고 **세션 등록 → 전체 시작 / 전체 중지** 순서로 기존과 똑같이 사용합니다.
+
+세션 표의 **대상 · 페이지 / 영상** 칸에는 다음 정보가 표시됩니다.
+- 현재 URL
+- 페이지 상태(로딩 중/로드됨/오류)
+- 페이지 로드 횟수
+- 영상: 있음/없음, `playing` · `paused` · `ended` · `error`, currentTime / duration, 반복 횟수
+- 마지막 오류
+
+기존 측정 항목(CPU, RAM, 메모리 압력, Swap, 브라우저 메모리, 프로세스 수, 세션별 메모리, 오류 수)과 보호 로직은 custom 세션에도 그대로 적용됩니다.
+
+### 로컬 테스트 페이지
+
+| 경로 | 용도 |
+|---|---|
+| `/lab/video` | 2초 WebM(VP9) HTML5 video. Video Playback 모드 확인용 |
+| `/lab/redirect-local` | 같은 호스트로 302 (허용) |
+| `/lab/redirect-external` | 외부 호스트로 302 (차단되는지 확인) |
+| `/lab/redirect-ip` | 클라우드 메타데이터 IP(169.254.169.254)로 302 (차단되는지 확인) |
+
+### allowlist 설정 (`lab.env`)
+
+```
+LAB_CUSTOM_ALLOWED_HOSTS=test.my-site.com,staging.my-site.com   # 정확한 호스트명, 쉼표 구분, 와일드카드 불가
+LAB_CUSTOM_RESOURCE_HOSTS=cdn.my-site.com                       # 하위 리소스(CDN 등)만 허용, 페이지로는 불가
+LAB_CUSTOM_ALLOW_PRIVATE_NETWORK=1                              # 사설 IP 대상(자체 LAN·스테이징)일 때만
+LAB_CUSTOM_HOST_OVERRIDES=staging.my-site.com=192.168.0.20      # 선택: 호스트→IP 고정
+LAB_CUSTOM_REQUIRE_VERIFICATION=1                               # 기본값. 외부 도메인 소유권 확인
+```
+
+`lab.env`를 고친 뒤에는 백엔드를 다시 시작해야 반영됩니다. 잘못된 항목과 차단 플랫폼 항목은 무시되고, 그 사유가 대시보드와 로그에 표시됩니다.
+
+**소유권 확인**
+- 외부 도메인(localhost 제외)은 세션을 처음 시작할 때 `http(s)://<호스트>/.well-known/blc-lab-verify.txt`를 읽습니다. 이 파일에 대시보드에 표시된 토큰이 들어 있어야 합니다.
+- 리다이렉트는 허용하지 않습니다.
+- 확인 결과는 1시간 동안 캐시합니다.
+- 확인에 실패하면 세션은 테스트를 시작하지 않고 `오류`로 끝납니다.
+- 토큰은 `backend/data/verification_token.txt`에 저장됩니다. 공개되어도 되는 값입니다.
+
+### 안전 설계 (SSRF 방어 포함)
+
+1. **백엔드 검증**: 등록할 때와 시작할 때마다 검사하므로, 프론트엔드를 우회한 직접 API 호출도 같은 규칙으로 막힙니다.
+   - `http`/`https`만 허용합니다(`file:`, `javascript:`, `data:` 등 차단).
+   - URL 안의 계정 정보, 공백, 백슬래시, 2048자 초과 URL을 거부합니다.
+   - localhost가 아닌 IP 직접 지정은 거부합니다.
+   - allowlist에 없는 호스트는 거부합니다.
+2. **외부 플랫폼 차단**: YouTube, Twitch, TikTok, Instagram, Facebook, X, 치지직, SOOP(아프리카TV), 네이버·카카오 TV, Vimeo, Netflix, Spotify 등 외부 미디어/SNS 플랫폼은 allowlist에 넣어도 거부합니다. 여러 자동 브라우저로 반복 재생하면 그 플랫폼의 조회수·시청시간을 조작하게 되기 때문입니다. 브라우저 안에서 이들 도메인으로 가는 하위 요청(임베드 플레이어 등)도 차단됩니다.
+3. **DNS 고정**: allowlist 호스트는 백엔드가 직접 이름을 조회하고, 결과가 공인 IP인지 확인합니다. 이어 `--host-resolver-rules`로 브라우저가 바로 그 IP에만 접속하게 고정합니다. 나머지 모든 이름은 조회 결과가 없는 것(NOTFOUND)으로 처리되어, DNS 리바인딩 공격을 막습니다.
+4. **네트워크 수준 차단**: custom 세션의 모든 연결은 존재하지 않는 프록시로 보내지고, localhost와 allowlist 호스트만 직접 접속합니다. Playwright의 요청 가로채기는 **리다이렉트 경유 요청을 보지 못하고**, DNS 고정은 **IP 직접 주소에는 적용되지 않기** 때문입니다. 그래서 `169.254.169.254` 같은 주소로 가는 리다이렉트도 연결 단계에서 실패합니다. 차단된 요청은 URL과 함께 세션 로그에 남습니다.
+5. **경로 검사**: 페이지 이동이 끝나면 최종 URL과 리다이렉트 경로 전체를 다시 검사합니다.
+6. **기존 basic 계열 시나리오**는 localhost 전용 정책 그대로이며, custom 기능과 무관하게 동작합니다.
+7. **탐지 회피 없음**: User-Agent는 Playwright 기본값(HeadlessChrome) 그대로입니다. 탐지를 피하는 설정이나 계정 로그인 기능은 넣지 않았습니다.
+
+### Video Playback 동작
+
+1. 페이지 로드 후 최대 10초 동안 `<video>`를 찾습니다. iframe 안의 영상은 대상이 아닙니다.
+2. Muted 설정을 적용하고 `play()`를 호출합니다. 브라우저는 `--autoplay-policy=no-user-gesture-required`로 실행되므로 Muted를 꺼도 재생할 수 있습니다.
+3. 1초마다 상태, currentTime/duration, 반복 횟수를 읽습니다.
+4. 다음 경우는 세션 오류로 기록합니다.
+   - 영상이 없을 때
+   - `play()`가 거부될 때
+   - 미디어 오류(`error` 이벤트)가 날 때
+   - 페이지를 잃었을 때
+
+   오류 후에는 간격만큼 기다렸다가 페이지를 다시 로드합니다. 재생이 시작되지 않은 채 연속 5번 실패하면 세션은 `오류`로 종료됩니다.
+5. Playwright의 Chromium은 H.264/AAC(독점 코덱)를 지원하지 않습니다. WebM(VP8/VP9/AV1)이나 Opus 영상으로 테스트하세요.
+
+### API
+
+```
+POST /api/sessions        {"count": 2, "scenario": "custom",
+                           "custom": {"url": "http://127.0.0.1:8000/lab/video", "mode": "video",
+                                      "reload_interval_s": 10, "muted": true, "loop": true}}
+                          → 201, 또는 400 {"detail": "URL not allowed: ..."}
+POST /api/custom/validate {"url": "..."} → 200 {ok, url, host, local, resolved_ips, verification_required, verify_url} | 400
+GET  /api/config          → custom: {allowed_hosts, resource_hosts, verification: {path, token}, local_test_pages, ...}
+```
+
+세션 응답에는 다음 필드가 추가됩니다.
+
+```
+custom, current_url, page_state, page_load_count,
+video: {present, state, current_time, duration, repeats, muted, loop}
+```
+
 ## 메모리 측정
 
 | 표시 항목 | macOS | Linux | 의미 |
@@ -150,6 +248,12 @@ cd frontend && npm run dev
 | 변수 | 기본값 | 설명 |
 |---|---|---|
 | `LAB_ENV_FILE` | `<프로젝트>/lab.env` | 머신 설정 파일 경로 |
+| `LAB_CUSTOM_ALLOWED_HOSTS` | (없음) | custom 시나리오 대상 외부 호스트(정확한 이름, 쉼표 구분) |
+| `LAB_CUSTOM_RESOURCE_HOSTS` | (없음) | 하위 리소스 전용 허용 호스트 |
+| `LAB_CUSTOM_ALLOW_PRIVATE_NETWORK` | `0` | `1`이면 allowlist 호스트가 사설 IP로 해석되어도 허용 |
+| `LAB_CUSTOM_HOST_OVERRIDES` | (없음) | `호스트=IP` 고정 매핑 |
+| `LAB_CUSTOM_REQUIRE_VERIFICATION` | `1` | 외부 도메인 소유권 확인 |
+| `LAB_CUSTOM_MIN_RELOAD_S` | `2` | Page Load 최소 새로고침 간격(초) |
 | `LAB_PORT` | `8000` | 백엔드 포트 |
 | `LAB_MAX_SESSIONS` | `100` | 등록 가능한 최대 세션 수(상한 100) |
 | `LAB_MAX_CONCURRENT` | 자동 (`lab.env`: 100) | 동시 실행 한도. 지정하지 않으면 `min(25, RAM(MB)/300, 코어수×3)` |
