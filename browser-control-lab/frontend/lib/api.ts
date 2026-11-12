@@ -62,6 +62,11 @@ export interface ProbeResult {
   video?: VideoStatus | null;
   blocked_subrequests?: string[];
   error?: string;
+  /** set when the URL is fine except that its host is not allowed yet ("내 서버 등록" possible) */
+  registrable_host?: string | null;
+  /** /api/custom/register only */
+  registered?: boolean;
+  already_allowed?: boolean;
 }
 
 export interface LabConfig {
@@ -73,6 +78,8 @@ export interface LabConfig {
     allow_private_network: boolean;
     require_verification: boolean;
     config_problems: string[];
+    /** hosts registered from the dashboard after the ownership check (removable) */
+    registered_hosts: string[];
     blocked_platform_examples: string[];
     min_reload_s: number;
     verification: { path: string; token: string };

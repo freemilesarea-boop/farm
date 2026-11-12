@@ -626,11 +626,11 @@ class SessionManager:
         return SessionManager._browser_args_for(s.custom)
 
     @staticmethod
-    def _browser_args_for(custom: dict | None) -> list[str]:
+    def _browser_args_for(custom: dict | None, pol=None) -> list[str]:
         if not custom:
             return list(LOCAL_ONLY_BROWSER_ARGS)
         # Same lockdown, but allow-listed hosts are pinned to their validated IPs.
-        pol = settings.custom_policy
+        pol = pol or settings.custom_policy
         rules = pol.resolver_rules()
         args = [a if not a.startswith("--host-resolver-rules=") else f"--host-resolver-rules={rules}"
                 for a in LOCAL_ONLY_BROWSER_ARGS if a != "--no-proxy-server"]
@@ -746,12 +746,13 @@ class SessionManager:
         self.db.log("info", f"Ownership verified for {tgt.origin}", session_id=s.id)
         return True
 
-    async def _ownership_problem(self, page: Page, tgt: ValidatedTarget) -> str | None:
-        """None if ``tgt`` is local, verification is off, cached, or the token file checks out."""
-        if tgt.local or not settings.custom_policy.require_verification:
+    async def _ownership_problem(self, page: Page, tgt: ValidatedTarget, *, force: bool = False) -> str | None:
+        """None if ``tgt`` is local, verification is off, cached, or the token file checks out.
+        ``force`` (dashboard registration) always fetches the file, ignoring the setting and the cache."""
+        if tgt.local or not (force or settings.custom_policy.require_verification):
             return None
         cached = self._verified_origins.get(tgt.origin)
-        if cached and time.time() - cached < 3600:
+        if cached and not force and time.time() - cached < 3600:
             return None
         token = settings.verification_token
         why = None
@@ -770,10 +771,30 @@ class SessionManager:
         return why
 
     # ------------------------------------------------------------------ URL probe ("URL 확인")
-    async def probe(self, url: str) -> dict[str, Any]:
+    async def register(self, url: str) -> dict[str, Any]:
+        """"내 서버 등록": allow the host of ``url`` from the dashboard, but only after it serves this
+        lab's ownership token. All other rules (platform block, SSRF/public-IP, redirects) still
+        apply. On success the host is persisted and the probe result is returned."""
+        from .custom_target import add_registered_host
+        pol = settings.custom_policy
+        host = pol.unlisted_host(url)
+        if host is None:
+            pol.validate(url)  # raises the precise reason (blocked platform, bad URL, ...)
+            out = await self.probe(url)  # already allowed -> plain check
+            out["registered"] = False
+            out["already_allowed"] = True
+            return out
+        out = await self.probe(url, policy=pol.with_host(host), force_verify=True)
+        out["registered"] = bool(out.get("verified")) and out.get("allowed", False)
+        if out["registered"]:
+            add_registered_host(settings.registered_hosts_path, host)
+            self.db.log("info", f"Host registered from dashboard after ownership check: {host}")
+        return out
+
+    async def probe(self, url: str, *, policy=None, force_verify: bool = False) -> dict[str, Any]:
         """Open ``url`` once in a short-lived Chromium under the custom-URL network policy and
         report what is there. Policy errors raise CustomURLError; resource limits raise LimitError."""
-        pol = settings.custom_policy
+        pol = policy or settings.custom_policy
         tgt = pol.validate(url)
         reason = self._resource_block_reason()
         if reason:
@@ -781,7 +802,8 @@ class SessionManager:
         out: dict[str, Any] = {
             "input_url": tgt.input_url, "normalized_url": tgt.url, "host": tgt.host, "local": tgt.local,
             "resolved_ips": tgt.ips, "media_kind": tgt.media_kind, "allowed": True, "blocked_reason": None,
-            "verification_required": (not tgt.local) and pol.require_verification, "verified": None,
+            "verification_required": (not tgt.local) and (force_verify or pol.require_verification),
+            "verified": None,
             "final_url": None, "redirects": [], "http_status": None, "content_type": None,
             "is_direct_video": False, "is_html": False, "video_found": None, "video": None,
         }
@@ -795,7 +817,7 @@ class SessionManager:
                 fake = {"mode": "video"}
                 browser = await pw.chromium.launch(
                     headless=settings.headless, executable_path=settings.chromium_executable,
-                    args=[f"{PROCESS_MARKER}={marker}", *self._browser_args_for(fake)])
+                    args=[f"{PROCESS_MARKER}={marker}", *self._browser_args_for(fake, pol)])
                 context = await browser.new_context(viewport={"width": 1280, "height": 800})
 
                 async def guard(route):
@@ -816,7 +838,7 @@ class SessionManager:
                 page = await context.new_page()
                 page.set_default_timeout(settings.page_timeout_ms)
 
-                why = await self._ownership_problem(page, tgt)
+                why = await self._ownership_problem(page, tgt, force=force_verify)
                 if out["verification_required"]:
                     out["verified"] = why is None
                 if why:

@@ -115,10 +115,15 @@ class Settings:
 
     @property
     def custom_policy(self):
-        from .custom_target import CustomPolicy
+        from .custom_target import registered_hosts
         return _policy_cache(self.custom_allowed_hosts, self.custom_resource_hosts,
                              self.custom_allow_private_network, self.custom_require_verification,
-                             self.custom_host_overrides)
+                             self.custom_host_overrides, registered_hosts(self.registered_hosts_path))
+
+    @property
+    def registered_hosts_path(self) -> Path:
+        """Hosts registered from the dashboard after the ownership check."""
+        return self.db_path.parent / "registered_hosts.json"
 
     @property
     def verification_token(self) -> str:
@@ -134,9 +139,10 @@ from functools import lru_cache  # noqa: E402
 
 
 @lru_cache(maxsize=8)
-def _policy_cache(allowed: str, resources: str, allow_private: bool, require_verification: bool, overrides: str):
+def _policy_cache(allowed: str, resources: str, allow_private: bool, require_verification: bool, overrides: str,
+                  registered: tuple[str, ...] = ()):
     from .custom_target import CustomPolicy
-    return CustomPolicy.from_strings(allowed, resources, allow_private, require_verification, overrides)
+    return CustomPolicy.from_strings(allowed, resources, allow_private, require_verification, overrides, registered)
 
 
 # Command-line marker added to every Chromium we launch, so that our own browser

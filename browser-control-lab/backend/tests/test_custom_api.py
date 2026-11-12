@@ -358,3 +358,64 @@ def test_stop_all_after_direct_video_and_probe(server):
     out = server.post("/api/sessions/stop-all").json()
     assert out["verified_clean"] and out["remaining_processes"] == 0
     assert server.get("/api/processes").json()["count"] == 0 and find_lab_processes(str(os.getpid())) == []
+
+
+# ================================================================ v3: register my own host from the dashboard
+MINE = f"http://mine.test:{PORT}"   # pinned to 127.0.0.1, but not allow-listed
+
+
+def test_register_host_requires_ownership_token(server):
+    import app.main as main
+    from fastapi.responses import PlainTextResponse
+    main.manager._verified_origins.clear()
+    url = f"{MINE}/lab/video"
+
+    # Not allowed yet: probe says so and offers registration; sessions are refused.
+    p = server.post("/api/custom/probe", json={"url": url}).json()
+    assert not p["allowed"] and p["registrable_host"] == "mine.test"
+    assert create(server, url).status_code == 400
+
+    # Registration without the token file fails and persists nothing.
+    r = server.post("/api/custom/register", json={"url": url}).json()
+    assert not r["registered"] and r["verified"] is False and "소유권 확인 실패" in r["blocked_reason"]
+    assert "mine.test" not in server.get("/api/config").json()["custom"]["allowed_hosts"]
+
+    token = settings.verification_token
+
+    async def verify():
+        return PlainTextResponse(token + "\n")
+    main.app.add_api_route("/.well-known/blc-lab-verify.txt", verify)
+    try:
+        r = server.post("/api/custom/register", json={"url": url}).json()
+        assert r["registered"] and r["verified"] and r["video_found"], r
+        cfg = server.get("/api/config").json()["custom"]
+        assert "mine.test" in cfg["allowed_hosts"] and cfg["registered_hosts"] == ["mine.test"]
+        assert server.post("/api/custom/probe", json={"url": url}).json()["allowed"]
+        # ... and the video now plays in a session
+        sid = start_one(server, url, mode="video", interval=1)
+        st = _wait(server, lambda st: (_by_id(st, sid).get("video") or {}).get("state") == "playing", timeout=40)
+        assert _by_id(st, sid)["errors"] == 0
+    finally:
+        main.app.router.routes[:] = [r for r in main.app.router.routes
+                                     if getattr(r, "path", "") != "/.well-known/blc-lab-verify.txt"]
+        main.manager._verified_origins.clear()
+        server.post("/api/sessions/stop-all")
+        server.delete("/api/sessions")
+
+    # Removing it closes the door again.
+    assert server.delete("/api/custom/registered/mine.test").status_code == 200
+    assert "mine.test" not in server.get("/api/config").json()["custom"]["allowed_hosts"]
+    assert create(server, url).status_code == 400
+    assert server.delete("/api/custom/registered/mine.test").status_code == 404
+
+
+@pytest.mark.parametrize("url, needle", [
+    ("https://www.youtube.com/watch?v=x", "third-party media/social platform"),
+    ("https://chzzk.naver.com/live/x", "third-party media/social platform"),
+    ("ftp://mine.test/x.mp4", "Only http and https"),
+])
+def test_register_refuses_platforms_and_bad_urls(server, url, needle):
+    r = server.post("/api/custom/register", json={"url": url}).json()
+    assert not r["registered"] and needle in r["blocked_reason"]
+    p = server.post("/api/custom/probe", json={"url": url}).json()
+    assert p["registrable_host"] is None

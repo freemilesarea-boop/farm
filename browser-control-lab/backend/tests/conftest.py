@@ -21,7 +21,8 @@ os.environ["LAB_PRESSURE_BLOCK_LEVEL"] = "warn"
 # explicitly in the tests that cover it.
 os.environ["LAB_CUSTOM_ALLOWED_HOSTS"] = "allowed.test"
 os.environ["LAB_CUSTOM_RESOURCE_HOSTS"] = "cdn.allowed.test"
-os.environ["LAB_CUSTOM_HOST_OVERRIDES"] = "allowed.test=127.0.0.1,cdn.allowed.test=127.0.0.1"
+# mine.test is NOT allow-listed: it is used to test registering a host from the dashboard.
+os.environ["LAB_CUSTOM_HOST_OVERRIDES"] = "allowed.test=127.0.0.1,cdn.allowed.test=127.0.0.1,mine.test=127.0.0.1"
 os.environ["LAB_CUSTOM_ALLOW_PRIVATE_NETWORK"] = "1"
 os.environ["LAB_CUSTOM_REQUIRE_VERIFICATION"] = "0"
 os.environ["LAB_CUSTOM_MIN_RELOAD_S"] = "1"

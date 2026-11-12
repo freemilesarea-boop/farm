@@ -133,3 +133,34 @@ def test_input_url_kept_verbatim():
     t = pol().validate("  " + raw + "  ")
     assert t.input_url == raw
     assert t.url == "http://localhost:8000/Lab/Video?Q=Ab%20C#t=1.5"
+
+
+# ---------------------------------------------------------------- dashboard registration
+@pytest.mark.parametrize("url, host", [
+    ("https://videos.mine.example/clip.mp4", "videos.mine.example"),
+    ("http://Other.Example:8080/page", "other.example"),
+    ("https://my-site.example/", None),              # already allowed
+    ("http://localhost:8000/lab/video", None),       # local, always allowed
+    ("https://youtube.com/watch?v=1", None),         # platforms are never registrable
+    ("https://m.twitch.tv/x", None),
+    ("http://10.0.0.5/v.mp4", None),                 # private IP literal without the LAN opt-in
+    ("ftp://mine.example/x", None),
+    ("http://u:p@mine.example/", None),
+])
+def test_unlisted_host(url, host):
+    assert pol().unlisted_host(url) == host
+
+
+def test_registered_hosts_are_allowed_but_platforms_never(tmp_path):
+    from app.custom_target import add_registered_host, registered_hosts, remove_registered_host
+    f = tmp_path / "registered_hosts.json"
+    add_registered_host(f, "mine.example")
+    add_registered_host(f, "mine.example")
+    assert registered_hosts(f) == ("mine.example",)
+    p = CustomPolicy.from_strings("my-site.example", "", False, True, "mine.example=93.184.216.36",
+                                  registered=(*registered_hosts(f), "youtube.com"))
+    assert "mine.example" in p.allowed_hosts and "youtube.com" not in p.allowed_hosts
+    assert p.registered_hosts == ("mine.example",)
+    assert p.validate("https://mine.example/v.webm").ips == ["93.184.216.36"]
+    assert remove_registered_host(f, "mine.example") and registered_hosts(f) == ()
+    assert not remove_registered_host(f, "mine.example")

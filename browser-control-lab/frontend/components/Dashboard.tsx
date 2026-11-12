@@ -328,8 +328,9 @@ function Controls({ state, busy, run }: { state: LabState; busy: string | null; 
   const [confirming, setConfirming] = useState(false);
   const [custom, setCustom] = useCustomForm();
   const [config, setConfig] = useState<LabConfig | null>(null);
+  const reloadConfig = () => api<LabConfig>("/api/config").then(setConfig).catch(() => setConfig(null));
   useEffect(() => {
-    api<LabConfig>("/api/config").then(setConfig).catch(() => setConfig(null));
+    reloadConfig();
   }, []);
   const isCustom = scenario === "custom";
   const urlLooksOk = /^https?:\/\/[^\s/]+/i.test(custom.url.trim());
@@ -447,7 +448,7 @@ function Controls({ state, busy, run }: { state: LabState; busy: string | null; 
         </div>
       </div>
 
-      {isCustom && <CustomPanel custom={custom} setCustom={setCustom} config={config} urlLooksOk={urlLooksOk} sessions={state.sessions} />}
+      {isCustom && <CustomPanel custom={custom} setCustom={setCustom} config={config} reloadConfig={reloadConfig} urlLooksOk={urlLooksOk} sessions={state.sessions} />}
 
       {confirming && (
         <div
@@ -575,12 +576,14 @@ function CustomPanel({
   custom,
   setCustom,
   config,
+  reloadConfig,
   urlLooksOk,
   sessions,
 }: {
   custom: CustomForm;
   setCustom: (c: CustomForm) => void;
   config: LabConfig | null;
+  reloadConfig: () => void;
   urlLooksOk: boolean;
   sessions: Session[];
 }) {
@@ -602,7 +605,34 @@ function CustomPanel({
       setProbing(false);
     }
   };
+  const [registering, setRegistering] = useState(false);
+  const register = async () => {
+    setRegistering(true);
+    setProbeErr(null);
+    try {
+      const r = await api<ProbeResult>("/api/custom/register", { method: "POST", body: JSON.stringify({ url: custom.url.trim() }) });
+      setProbe(r);
+      if (r.registered) reloadConfig();
+    } catch (e) {
+      setProbeErr((e as Error).message);
+    } finally {
+      setRegistering(false);
+    }
+  };
+  const unregister = async (host: string) => {
+    if (!window.confirm(`${host} 등록을 해제할까요? 이 도메인의 세션은 더 이상 접속할 수 없습니다.`)) return;
+    try {
+      await api(`/api/custom/registered/${encodeURIComponent(host)}`, { method: "DELETE" });
+    } catch (e) {
+      setProbeErr((e as Error).message);
+    }
+    reloadConfig();
+  };
+  const copyToken = () => {
+    if (c) navigator.clipboard?.writeText(c.verification.token).then(() => setCopied(true));
+  };
   const probeStale = probe && probe.input_url !== custom.url.trim();
+  const regHost = !probeStale && probe && !probe.allowed ? probe.registrable_host || (probe.registered === false && probe.verified === false ? probe.host : null) : null;
   const notice = formChangeNotice(custom, sessions);
   const registered = Array.from(
     sessions
@@ -670,8 +700,40 @@ function CustomPanel({
       {probe && (
         <>
           {probeStale && <p className="mt-2 text-xs text-amber-700 dark:text-amber-400">아래 결과는 이전에 확인한 URL에 대한 것입니다. 다시 확인하세요.</p>}
+          {probe.registered && (
+            <p role="status" className="mt-2 rounded-md border border-emerald-300 bg-emerald-50 px-2 py-1.5 text-xs font-medium text-emerald-900 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-200">
+              ✓ {probe.host} 등록 완료 (소유권 확인됨). 이제 위에서 세션을 등록·시작하면 이 URL이 재생됩니다.
+            </p>
+          )}
           <ProbeView r={probe} />
         </>
+      )}
+      {regHost && c && (
+        <div className="mt-2 rounded-md border border-sky-300 bg-white p-2 text-xs leading-relaxed text-slate-700 dark:border-sky-800 dark:bg-slate-900 dark:text-slate-200">
+          <b>내 서버 등록</b> — <span className="font-mono">{regHost}</span> 이(가) 내 서버라면 lab.env 수정·재시작 없이 바로 등록할 수 있습니다.
+          <ol className="mt-1 list-decimal pl-5">
+            <li>
+              아래 토큰만 들어 있는 텍스트 파일을{" "}
+              <span className="break-all font-mono">
+                {custom.url.trim().match(/^https?:\/\/[^/?#]+/i)?.[0]}
+                {c.verification.path}
+              </span>{" "}
+              에 올리세요.
+              <div className="mt-1 flex items-center gap-2">
+                <code className="truncate rounded bg-slate-100 px-1.5 py-0.5 dark:bg-slate-800">{c.verification.token}</code>
+                <button type="button" className="text-sky-700 underline dark:text-sky-400" onClick={copyToken}>
+                  {copied ? "복사됨" : "복사"}
+                </button>
+              </div>
+            </li>
+            <li>
+              <Btn disabled={registering || probing} onClick={register} title="토큰 파일을 확인하고, 맞으면 도메인을 등록한 뒤 영상을 확인합니다">
+                {registering ? "확인 중…" : "확인 후 등록"}
+              </Btn>
+            </li>
+          </ol>
+          <span className="text-slate-500">YouTube·치지직·SOOP 같은 외부 플랫폼, Google Drive·Dropbox 공유 링크는 토큰을 올릴 수 없어 등록되지 않습니다.</span>
+        </div>
       )}
       {notice && (
         <p role="alert" className="mt-2 rounded-md border border-amber-300 bg-amber-50 px-2 py-1.5 text-xs font-medium text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
@@ -694,7 +756,20 @@ function CustomPanel({
           {c && c.allowed_hosts.length > 0 ? ` · ${c.allowed_hosts.join(", ")}` : " · 추가 도메인 없음"}
           {c && c.resource_hosts.length > 0 && <span> · 리소스 전용: {c.resource_hosts.join(", ")}</span>}
           <br />
-          도메인 추가: <code>lab.env</code>의 <code>LAB_CUSTOM_ALLOWED_HOSTS</code> 수정 후 백엔드 재시작. YouTube·Twitch·TikTok·치지직 등 외부 미디어/SNS 플랫폼은 등록할 수 없습니다.
+          {c && c.registered_hosts.length > 0 && (
+            <span className="block">
+              대시보드에서 등록한 도메인:{" "}
+              {c.registered_hosts.map((h) => (
+                <span key={h} className="mr-2 font-mono">
+                  {h}{" "}
+                  <button type="button" className="text-rose-700 underline dark:text-rose-400" onClick={() => unregister(h)}>
+                    해제
+                  </button>
+                </span>
+              ))}
+            </span>
+          )}
+          도메인 추가: URL 입력 → <b>URL 확인</b> → <b>확인 후 등록</b> (또는 <code>lab.env</code>의 <code>LAB_CUSTOM_ALLOWED_HOSTS</code> 수정 후 재시작). YouTube·Twitch·TikTok·치지직 등 외부 미디어/SNS 플랫폼은 등록할 수 없습니다.
           {c && c.config_problems.length > 0 && (
             <span className="block text-amber-700 dark:text-amber-400">무시된 allowlist 항목: {c.config_problems.join(" / ")}</span>
           )}
@@ -713,13 +788,7 @@ function CustomPanel({
             <b>외부 도메인 소유권 확인</b>: 테스트 대상 서버의 <code>{c.verification.path}</code> 에 아래 토큰을 넣어 두세요. 첫 실행 때 확인합니다(localhost는 불필요).
             <div className="mt-1 flex items-center gap-2">
               <code className="truncate rounded bg-white px-1.5 py-0.5 dark:bg-slate-900">{c.verification.token}</code>
-              <button
-                type="button"
-                className="text-sky-700 underline dark:text-sky-400"
-                onClick={() => {
-                  navigator.clipboard?.writeText(c.verification.token).then(() => setCopied(true));
-                }}
-              >
+              <button type="button" className="text-sky-700 underline dark:text-sky-400" onClick={copyToken}>
                 {copied ? "복사됨" : "복사"}
               </button>
             </div>

@@ -118,9 +118,31 @@ async def probe_custom_url(body: ValidateURL):
     try:
         return await manager.probe(body.url)
     except CustomURLError as exc:
-        return {"input_url": body.url.strip(), "allowed": False, "blocked_reason": str(exc)}
+        return {"input_url": body.url.strip(), "allowed": False, "blocked_reason": str(exc),
+                "registrable_host": settings.custom_policy.unlisted_host(body.url)}
     except LimitError as exc:
         raise HTTPException(status_code=429, detail=str(exc))
+
+
+@app.post("/api/custom/register")
+async def register_custom_host(body: ValidateURL):
+    """"내 서버 등록": allow the URL's host without editing lab.env, after the host serves this
+    lab's token at /.well-known/blc-lab-verify.txt. Third-party platforms are never registrable."""
+    try:
+        return await manager.register(body.url)
+    except CustomURLError as exc:
+        return {"input_url": body.url.strip(), "allowed": False, "registered": False, "blocked_reason": str(exc)}
+    except LimitError as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
+
+
+@app.delete("/api/custom/registered/{host}")
+async def unregister_custom_host(host: str):
+    from .custom_target import remove_registered_host
+    if not remove_registered_host(settings.registered_hosts_path, host.strip().lower()):
+        raise HTTPException(status_code=404, detail=f"{host} is not a dashboard-registered host")
+    manager.db.log("info", f"Dashboard-registered host removed: {host}")
+    return {"removed": host}
 
 
 @app.post("/api/custom/validate")

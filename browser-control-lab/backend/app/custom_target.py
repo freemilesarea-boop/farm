@@ -23,6 +23,7 @@ The lab only ever drives browsers at targets the operator owns or is authorised 
 from __future__ import annotations
 
 import ipaddress
+import json
 import secrets
 import socket
 from dataclasses import dataclass, field
@@ -151,14 +152,43 @@ class CustomPolicy:
     require_verification: bool = True
     host_overrides: dict[str, str] = field(default_factory=dict)
     config_problems: tuple[str, ...] = ()
+    # Hosts the operator registered from the dashboard after passing the ownership check
+    # (also contained in allowed_hosts). Kept separately so the UI can list/remove them.
+    registered_hosts: tuple[str, ...] = ()
 
     @classmethod
     def from_strings(cls, allowed: str, resources: str, allow_private: bool, require_verification: bool,
-                     overrides: str) -> "CustomPolicy":
+                     overrides: str, registered: tuple[str, ...] = ()) -> "CustomPolicy":
         a, p1 = parse_host_list(allowed)
+        reg, _ = parse_host_list(" ".join(registered))  # re-check: platforms etc. are never let through
+        reg = [h for h in reg if h not in a]
+        a = a + reg
         r, p2 = parse_host_list(resources)
         return cls(tuple(a), tuple(h for h in r if h not in a), allow_private, require_verification,
-                   parse_overrides(overrides), tuple(p1 + p2))
+                   parse_overrides(overrides), tuple(p1 + p2), tuple(reg))
+
+    def with_host(self, host: str) -> "CustomPolicy":
+        """Copy of this policy that also allows ``host`` (used only while checking a registration)."""
+        from dataclasses import replace
+        if host in self.allowed_hosts:
+            return self
+        return replace(self, allowed_hosts=(*self.allowed_hosts, host),
+                       resource_hosts=tuple(h for h in self.resource_hosts if h != host))
+
+    def unlisted_host(self, url: str) -> str | None:
+        """The host of ``url`` when the URL is fine except that its host is not allow-listed yet,
+        i.e. it could be registered from the dashboard after the ownership check. Else None."""
+        try:
+            host = _norm_host(urlsplit(url.strip()).hostname or "")
+        except (ValueError, CustomURLError):
+            return None
+        if not host or host in LOCAL_HOSTS or host in self.allowed_hosts:
+            return None
+        try:
+            self.with_host(host).validate(url, resolve=False)
+        except CustomURLError:
+            return None
+        return host
 
     # ------------------------------------------------------------------ resolution
     def resolve(self, host: str) -> list[str]:
@@ -216,8 +246,9 @@ class CustomPolicy:
             local = False
             if host not in self.allowed_hosts:
                 raise CustomURLError(
-                    f"{host} is not in the allowlist. Add it to LAB_CUSTOM_ALLOWED_HOSTS in lab.env "
-                    "(only hosts you own or are authorised to test) and restart the backend.")
+                    f"{host} is not in the allowlist. Register it from the dashboard (\"내 서버 등록\": "
+                    "ownership check) or add it to LAB_CUSTOM_ALLOWED_HOSTS in lab.env and restart the "
+                    "backend (only hosts you own or are authorised to test).")
             if _is_ip(host) and not self.allow_private_network and not is_public_ip(host):
                 raise CustomURLError(f"{host} is a non-public address")
             ips = self.resolve(host) if resolve else []
@@ -279,6 +310,7 @@ class CustomPolicy:
             "allow_private_network": self.allow_private_network,
             "require_verification": self.require_verification,
             "config_problems": list(self.config_problems),
+            "registered_hosts": list(self.registered_hosts),
             "blocked_platform_examples": ["youtube.com", "twitch.tv", "tiktok.com", "instagram.com",
                                           "afreecatv.com", "chzzk.naver.com"],
         }
@@ -318,3 +350,42 @@ def load_or_create_token(path: Path) -> str:
     tok = "blc-lab-" + secrets.token_hex(16)
     path.write_text(tok + "\n")
     return tok
+
+
+# ---------------------------------------------------------------------- dashboard registrations
+_REGISTERED: dict[str, tuple[str, ...]] = {}
+
+
+def registered_hosts(path: Path) -> tuple[str, ...]:
+    """Hosts registered from the dashboard (persisted as JSON next to the database)."""
+    key = str(path)
+    if key not in _REGISTERED:
+        try:
+            data = json.loads(path.read_text())
+            hosts = data.get("hosts", []) if isinstance(data, dict) else []
+            _REGISTERED[key] = tuple(h for h in hosts if isinstance(h, str))
+        except (OSError, ValueError):
+            _REGISTERED[key] = ()
+    return _REGISTERED[key]
+
+
+def _save_registered(path: Path, hosts: tuple[str, ...]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"hosts": list(hosts)}, indent=2) + "\n")
+    tmp.replace(path)
+    _REGISTERED[str(path)] = hosts
+
+
+def add_registered_host(path: Path, host: str) -> None:
+    hosts = registered_hosts(path)
+    if host not in hosts:
+        _save_registered(path, (*hosts, host))
+
+
+def remove_registered_host(path: Path, host: str) -> bool:
+    hosts = registered_hosts(path)
+    if host not in hosts:
+        return False
+    _save_registered(path, tuple(h for h in hosts if h != host))
+    return True
