@@ -164,3 +164,54 @@ def test_registered_hosts_are_allowed_but_platforms_never(tmp_path):
     assert p.validate("https://mine.example/v.webm").ips == ["93.184.216.36"]
     assert remove_registered_host(f, "mine.example") and registered_hosts(f) == ()
     assert not remove_registered_host(f, "mine.example")
+
+
+# ---------------------------------------------------------------- YouTube single-session test
+from app.custom_target import youtube_host_allowed, youtube_video_id  # noqa: E402
+
+
+@pytest.mark.parametrize("url, vid", [
+    ("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+    ("https://youtube.com/watch?v=dQw4w9WgXcQ&t=10s", "dQw4w9WgXcQ"),
+    ("https://m.youtube.com/watch?feature=share&v=dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+    ("https://youtu.be/dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+    ("https://youtu.be/dQw4w9WgXcQ?si=abc", "dQw4w9WgXcQ"),
+    ("https://www.youtube.com/shorts/dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+    ("https://www.youtube.com/watch?v=short", None),
+    ("https://www.youtube.com/@channel", None),
+    ("https://www.youtube.com/", None),
+    ("https://music.youtube.com/watch?v=dQw4w9WgXcQ", None),
+    ("https://evil.example/watch?v=dQw4w9WgXcQ", None),
+])
+def test_youtube_video_id(url, vid):
+    assert youtube_video_id(url) == vid
+
+
+def test_youtube_only_with_explicit_opt_in():
+    p = pol(overrides="www.youtube.com=142.250.0.1,youtu.be=142.250.0.2")
+    with pytest.raises(CustomURLError, match="third-party media/social platform"):
+        p.validate("https://www.youtube.com/watch?v=dQw4w9WgXcQ")          # default: still blocked
+    t = p.validate("https://www.youtube.com/watch?v=dQw4w9WgXcQ", allow_youtube=True)
+    assert t.media_kind == "youtube" and t.input_url == t.url
+    assert p.validate("https://youtu.be/dQw4w9WgXcQ", allow_youtube=True).media_kind == "youtube"
+    for url in ["https://www.twitch.tv/x", "https://www.tiktok.com/@x/video/1", "https://chzzk.naver.com/live/x",
+                "https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ", "https://music.youtube.com/watch?v=dQw4w9WgXcQ"]:
+        with pytest.raises(CustomURLError):
+            p.validate(url, allow_youtube=True)                            # the exception is YouTube only
+    with pytest.raises(CustomURLError, match="one video URL"):
+        p.validate("https://www.youtube.com/feed/trending", allow_youtube=True)
+    # the opt-in never widens the normal allowlist
+    assert "www.youtube.com" not in p.allowed_hosts and not p.host_allowed("https://www.youtube.com/", navigation=True)
+
+
+def test_youtube_network_rules():
+    assert youtube_host_allowed("https://www.youtube.com/watch?v=1", navigation=True)
+    assert youtube_host_allowed("https://rr3---sn-abc.googlevideo.com/videoplayback", navigation=False)
+    assert youtube_host_allowed("https://i.ytimg.com/vi/x.jpg", navigation=False)
+    assert not youtube_host_allowed("https://rr3---sn-abc.googlevideo.com/", navigation=True)
+    assert not youtube_host_allowed("https://evil.example/", navigation=False)
+    assert not youtube_host_allowed("https://www.twitch.tv/", navigation=False)
+    assert not youtube_host_allowed("http://169.254.169.254/latest", navigation=False)
+    assert not youtube_host_allowed("https://u:p@www.youtube.com/", navigation=True)
+    rules = pol().youtube_resolver_rules()
+    assert "EXCLUDE *.googlevideo.com" in rules and "MAP * ~NOTFOUND" in rules

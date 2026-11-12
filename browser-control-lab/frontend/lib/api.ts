@@ -11,7 +11,7 @@ export interface CustomConfig {
   url: string;
   /** normalised URL the browser navigates to */
   nav_url?: string;
-  kind?: "page" | "video_file";
+  kind?: "page" | "video_file" | "youtube";
   registered_at?: number;
   mode: CustomMode;
   reload_interval_s: number;
@@ -115,6 +115,10 @@ export interface Session {
   page_state: "idle" | "loading" | "loaded" | "error";
   page_load_count: number;
   video: VideoStatus | null;
+  peak_memory_mb?: number | null;
+  peak_process_count?: number;
+  /** YouTube single-session compatibility test */
+  youtube?: boolean;
 }
 
 export interface LogEntry {
@@ -194,4 +198,15 @@ export async function api<T = unknown>(path: string, init?: RequestInit): Promis
     throw new ApiError(`${res.status}: ${detail}`);
   }
   return (res.status === 204 ? undefined : await res.json()) as T;
+}
+
+/** youtube.com / youtu.be video URL → YouTube single-session compatibility test (mirrors the backend rule). */
+export function isYouTubeUrl(url: string): boolean {
+  try {
+    const u = new URL(url.trim());
+    const h = u.hostname.toLowerCase().replace(/\.$/, "");
+    return ["youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"].includes(h);
+  } catch {
+    return false;
+  }
 }

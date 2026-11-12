@@ -22,7 +22,7 @@ from .db import Database
 from .procs import (alive_tracked, describe, find_lab_processes, kill_lab_processes, kill_tracked,
                     snapshot_pids)
 from .sysmem import PRESSURE_ORDER, MemoryReader, MemorySnapshot, process_memory
-from .custom_target import CustomURLError, ValidatedTarget
+from .custom_target import CustomURLError, ValidatedTarget, youtube_host_allowed, youtube_video_id
 from .security import assert_local_url, is_local_url, redact
 from .testpages import SCENARIOS
 
@@ -80,6 +80,47 @@ VIDEO_STATUS_JS = """() => {
           current_src: v.currentSrc || v.src || null, video_count: document.querySelectorAll('video').length,
           repeats: b ? b.repeats : 0, errors: b ? b.errors.splice(0) : [], muted: v.muted};
 }"""
+# --- YouTube single-session compatibility test (one playback, no loop / reload / retry) ---
+# Minimum gap between two YouTube test runs, so the API cannot be scripted into a repeat-view loop.
+YOUTUBE_COOLDOWN_S = 600
+YOUTUBE_PLAYER_TIMEOUT_MS = 20_000
+_YT_STATUS_BODY = """
+  const p = document.getElementById('movie_player');
+  const v = document.querySelector('#movie_player video') || document.querySelector('video');
+  const api = !!(p && typeof p.getPlayerState === 'function');
+  if (!p && !v) return {present: false};
+  const ps = api ? p.getPlayerState() : null;   // -1 unstarted, 0 ended, 1 playing, 2 paused, 3 buffering, 5 cued
+  const ad = !!(p && p.classList && p.classList.contains('ad-showing'));
+  const num = (x) => (typeof x === 'number' && isFinite(x)) ? x : null;
+  const ct = api ? num(p.getCurrentTime()) : (v ? num(v.currentTime) : null);
+  const du = api ? num(p.getDuration()) : (v ? num(v.duration) : null);
+  let state;
+  if (v && v.error) state = 'error';
+  else if (ps === 0 || (ps === null && v && v.ended)) state = ad ? 'playing' : 'ended';
+  else if (ps === 1 || ps === 3 || (ps === null && v && !v.paused)) state = 'playing';
+  else state = 'paused';
+  return {present: true, player_api: api, player_state: ps, ad_showing: ad, state,
+          current_time: ct, duration: du, ready_state: v ? v.readyState : null,
+          network_state: v ? v.networkState : null, paused: v ? v.paused : null, ended: state === 'ended',
+          error: v && v.error ? {code: v.error.code, message: v.error.message || ''} : null,
+          muted: v ? v.muted : null, href: location.href};
+"""
+YOUTUBE_STATUS_JS = "() => {" + _YT_STATUS_BODY + "}"
+# Start one playback. Never loops: the player's loop flag and the element's loop are forced off.
+YOUTUBE_START_JS = """async (opts) => {
+  const p = document.getElementById('movie_player');
+  const v = document.querySelector('#movie_player video') || document.querySelector('video');
+  if (!p && !v) return {present: false};
+  try { if (p && typeof p.setLoop === 'function') p.setLoop(false); } catch (e) {}
+  if (v) { v.loop = false; v.muted = !!opts.muted; }
+  try { if (p && opts.muted && typeof p.mute === 'function') p.mute(); } catch (e) {}
+  try {
+    if (p && typeof p.playVideo === 'function') p.playVideo();
+    else if (v) await v.play();
+    return {present: true, started: true};
+  } catch (e) { return {present: true, started: false, error: e.name + ': ' + e.message}; }
+}"""
+
 READY_STATES = ["HAVE_NOTHING", "HAVE_METADATA", "HAVE_CURRENT_DATA", "HAVE_FUTURE_DATA", "HAVE_ENOUGH_DATA"]
 NETWORK_STATES = ["NETWORK_EMPTY", "NETWORK_IDLE", "NETWORK_LOADING", "NETWORK_NO_SOURCE"]
 MEDIA_ERRORS = {1: "MEDIA_ERR_ABORTED", 2: "MEDIA_ERR_NETWORK", 3: "MEDIA_ERR_DECODE", 4: "MEDIA_ERR_SRC_NOT_SUPPORTED"}
@@ -134,6 +175,8 @@ class TestSession:
     memory_rss_mb: float | None = None    # RSS sum (overstates: shared pages counted per process)
     memory_method: str | None = None
     process_count: int = 0
+    peak_memory_mb: float | None = None   # highest USS seen during the current/last run
+    peak_process_count: int = 0
     tracked: set = field(default_factory=set, repr=False)  # {(pid, create_time)} ever seen
     run_id: int | None = None
     crashed: bool = False
@@ -149,6 +192,10 @@ class TestSession:
     task: asyncio.Task | None = field(default=None, repr=False)
     stop_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     browser: Browser | None = field(default=None, repr=False)
+
+    @property
+    def is_youtube(self) -> bool:
+        return bool(self.custom) and self.custom.get("kind") == "youtube"
 
     @property
     def marker(self) -> str:
@@ -202,6 +249,9 @@ class TestSession:
             "memory_rss_mb": self.memory_rss_mb,
             "memory_method": self.memory_method,
             "process_count": self.process_count,
+            "peak_memory_mb": self.peak_memory_mb,
+            "peak_process_count": self.peak_process_count,
+            "youtube": self.is_youtube,
         }
 
 
@@ -261,6 +311,8 @@ class SessionManager:
         self._lock = asyncio.Lock()  # guards admission decisions
         self._verified_origins: dict[str, float] = {}
         self._probe_sem = asyncio.Semaphore(1)
+        self.youtube_cooldown_s = YOUTUBE_COOLDOWN_S
+        self._youtube_last_start: float | None = None
 
     # ------------------------------------------------------------------ lifecycle
     async def startup(self) -> None:
@@ -348,6 +400,10 @@ class SessionManager:
         mem = process_memory(procs)
         s.process_count = len(procs)
         s.memory_mb, s.memory_rss_mb, s.memory_method = mem["uss_mb"], mem["rss_mb"], mem["method"]
+        if s.status in ACTIVE_STATES:
+            if s.memory_mb is not None and (s.peak_memory_mb is None or s.memory_mb > s.peak_memory_mb):
+                s.peak_memory_mb = s.memory_mb
+            s.peak_process_count = max(s.peak_process_count, s.process_count)
 
     # ------------------------------------------------------------------ registry
     def create_sessions(self, count: int, scenario: str, name_prefix: str | None = None,
@@ -362,6 +418,13 @@ class SessionManager:
             custom = None
         if count < 1:
             raise ValueError("count must be >= 1")
+        if custom and custom.get("kind") == "youtube":
+            if count != 1:
+                raise LimitError("YouTube URL — 단일 세션 호환성 테스트만 가능합니다 (세션 수 1)")
+            if any(x.is_youtube for x in self.sessions.values()):
+                raise LimitError("YouTube 세션은 1개만 등록할 수 있습니다. 기존 YouTube 세션을 삭제하거나 교체하세요.")
+            if custom.get("loop") or custom.get("mode") != "video":
+                raise ValueError("YouTube single session: loop and reload are not allowed")
         if len(self.sessions) + count > settings.max_sessions:
             raise LimitError(
                 f"Session limit reached: {len(self.sessions)} registered, max {settings.max_sessions}"
@@ -426,7 +489,11 @@ class SessionManager:
             if reason:
                 self.db.log("warning", f"Start blocked: {reason}", session_id=sid)
                 raise LimitError(reason)
-            if s.custom:
+            if s.is_youtube:
+                self._youtube_start_check(s)
+                s.target = settings.custom_policy.validate(s.custom["url"], allow_youtube=True)
+                self._youtube_last_start = time.time()
+            elif s.custom:
                 # Re-validate at every start (allowlist may have changed; DNS re-checked).
                 s.target = settings.custom_policy.validate(s.custom["url"])
             else:
@@ -441,6 +508,22 @@ class SessionManager:
             s.task = asyncio.create_task(self._run(s), name=f"session-{s.id}")
         self.db.log("info", f"Starting {s.name}", session_id=sid, data={"target": s.target_url})
         return s
+
+    def _youtube_start_check(self, s: TestSession) -> None:
+        """Server-side limits for the YouTube single-session test (API calls included)."""
+        others = [x for x in self.sessions.values() if x.is_youtube and x.id != s.id]
+        if others:
+            raise LimitError("YouTube 세션은 1개만 허용됩니다 (다른 YouTube 세션이 등록되어 있음)")
+        if any(x.is_youtube and x.status in ACTIVE_STATES for x in self.sessions.values()):
+            raise LimitError("YouTube 세션이 이미 실행 중입니다")
+        self._youtube_cooldown_check()
+
+    def _youtube_cooldown_check(self) -> None:
+        if self._youtube_last_start is not None:
+            wait = self.youtube_cooldown_s - (time.time() - self._youtube_last_start)
+            if wait > 0:
+                raise LimitError(f"YouTube 호환성 테스트는 {self.youtube_cooldown_s // 60:.0f}분에 한 번만 실행할 수 "
+                                 f"있습니다 (반복 재생 방지). {wait / 60:.1f}분 후 다시 시도하세요.")
 
     async def stop(self, sid: str, reason: str = "user_stop") -> TestSession:
         s = self.get(sid)
@@ -460,6 +543,9 @@ class SessionManager:
         return s
 
     async def restart(self, sid: str) -> TestSession:
+        s = self.get(sid)
+        if s.is_youtube:
+            self._youtube_cooldown_check()  # refuse before stopping the running test
         await self.stop(sid, reason="restart")
         return await self.start(sid)
 
@@ -468,7 +554,9 @@ class SessionManager:
         and take a fresh CPU/RAM reading, so the resource guard sees the real load before
         admitting more (otherwise a bulk start would admit everything before CPU rises)."""
         started, skipped = [], []
-        pending = [s for s in self.sessions.values() if s.status not in ACTIVE_STATES]
+        pending = [s for s in self.sessions.values() if s.status not in ACTIVE_STATES and not s.is_youtube]
+        yt_skipped = [{"id": s.id, "reason": "YouTube 단일 세션은 전체 시작에서 제외됩니다 (개별 시작만 가능)"}
+                      for s in self.sessions.values() if s.status not in ACTIVE_STATES and s.is_youtube]
         blocked_reason: str | None = None
         for i in range(0, len(pending), wave_size):
             wave = []
@@ -490,6 +578,7 @@ class SessionManager:
             if i + wave_size < len(pending):
                 await asyncio.sleep(1.0)
                 self.monitor.sample()  # fresh reading including the wave just launched
+        skipped += yt_skipped
         if skipped:
             self.db.log("warning", f"Start-all: {len(started)} started, {len(skipped)} blocked",
                         data={"first_reason": skipped[0]["reason"]})
@@ -544,6 +633,8 @@ class SessionManager:
         s.page_load_count = 0
         s.video = {}
         s.last_blocked_url = None
+        s.peak_memory_mb = None
+        s.peak_process_count = 0
 
     def _record_error(self, s: TestSession, message: str) -> None:
         s.errors += 1
@@ -578,6 +669,13 @@ class SessionManager:
 
             if s.custom and not await self._verify_ownership(s, page):
                 end_reason = "error"
+                s.stop_event.set()
+
+            if s.is_youtube and not s.stop_event.is_set():
+                # Exactly one page load and at most one playback; then the session ends.
+                # No reload, no loop, no restart after "ended", no retry on failure.
+                ok = await self._youtube_once(s, page)
+                end_reason = "stopped" if ok and not s.crashed else "error"
                 s.stop_event.set()
 
             while not s.stop_event.is_set():
@@ -631,13 +729,20 @@ class SessionManager:
             return list(LOCAL_ONLY_BROWSER_ARGS)
         # Same lockdown, but allow-listed hosts are pinned to their validated IPs.
         pol = pol or settings.custom_policy
-        rules = pol.resolver_rules()
+        youtube = custom.get("kind") == "youtube"
+        rules = pol.youtube_resolver_rules() if youtube else pol.resolver_rules()
         args = [a if not a.startswith("--host-resolver-rules=") else f"--host-resolver-rules={rules}"
                 for a in LOCAL_ONLY_BROWSER_ARGS if a != "--no-proxy-server"]
-        args += pol.proxy_args()
+        args += pol.youtube_proxy_args() if youtube else pol.proxy_args()
         if custom["mode"] == "video":
             args.append("--autoplay-policy=no-user-gesture-required")
         return args
+
+    @staticmethod
+    def _custom_allowed(s: TestSession, url: str, *, navigation: bool) -> bool:
+        if s.is_youtube:
+            return youtube_host_allowed(url, navigation=navigation)
+        return settings.custom_policy.host_allowed(url, navigation=navigation)
 
     _NET_BLOCK_ERRORS = ("ERR_NAME_NOT_RESOLVED", "ERR_PROXY_CONNECTION_FAILED", "ERR_TUNNEL_CONNECTION_FAILED",
                          "ERR_BLOCKED_BY_CLIENT")
@@ -646,8 +751,7 @@ class SessionManager:
         """Requests stopped by the network-level policy (redirect hops, IP literals) never reach the
         route guard, so log them here with their URL."""
         err = req.failure or ""
-        if any(e in err for e in self._NET_BLOCK_ERRORS) and not settings.custom_policy.host_allowed(
-                req.url, navigation=False):
+        if any(e in err for e in self._NET_BLOCK_ERRORS) and not self._custom_allowed(s, req.url, navigation=False):
             s.blocked_requests += 1
             s.last_blocked_url = req.url[:200]
             self.db.log("warning", f"Blocked by network policy ({err}): {req.url[:200]}", session_id=s.id)
@@ -660,7 +764,7 @@ class SessionManager:
                 main_nav = req.is_navigation_request() and req.frame.parent_frame is None
             except Exception:
                 main_nav = False
-            ok = settings.custom_policy.host_allowed(url, navigation=main_nav)
+            ok = self._custom_allowed(s, url, navigation=main_nav)
         else:
             ok = is_local_url(url)
         if ok:
@@ -719,14 +823,13 @@ class SessionManager:
 
     def _final_url_ok(self, s: TestSession, page: Page, resp) -> bool:
         """Defence in depth: re-check every redirect hop and the final URL against the policy."""
-        pol = settings.custom_policy
         hops = []
         req = resp.request if resp else None
         while req is not None:
             hops.append(req.url)
             req = req.redirected_from
         for u in [page.url, *hops]:
-            if not pol.host_allowed(u, navigation=True):
+            if not self._custom_allowed(s, u, navigation=True):
                 s.page_state = "error"
                 self._record_error(s, f"Redirect left the allowlist: {u[:200]} (navigation refused)")
                 return False
@@ -735,7 +838,7 @@ class SessionManager:
     async def _verify_ownership(self, s: TestSession, page: Page) -> bool:
         """Non-local custom targets must serve this lab's token at /.well-known/blc-lab-verify.txt."""
         tgt = s.target
-        if tgt is None or tgt.local or not settings.custom_policy.require_verification:
+        if tgt is None or tgt.local or s.is_youtube or not settings.custom_policy.require_verification:
             return True
         why = await self._ownership_problem(page, tgt)
         if why:
@@ -898,6 +1001,69 @@ class SessionManager:
                     self.db.log("error", f"URL probe left {len(left)} processes")
                 self.db.log("info", f"URL probe: {tgt.input_url[:200]} -> allowed={out['allowed']} "
                                     f"status={out['http_status']} video={out['video_found']}")
+
+    async def _youtube_once(self, s: TestSession, page: Page) -> bool:
+        """YouTube single-session compatibility check: open the URL once, find the player, start one
+        playback and watch it until it ends (or the user stops). Returns True on a clean run.
+        Never reloads, loops, restarts after 'ended' or retries; leaving the video (e.g. YouTube's
+        autoplay of the next video) ends the run."""
+        if not await self._iteration(s, page):
+            return False
+        vid = youtube_video_id(s.custom["url"])
+        muted = bool(s.custom.get("muted", True))
+        try:
+            await page.wait_for_selector("#movie_player, video", state="attached", timeout=YOUTUBE_PLAYER_TIMEOUT_MS)
+        except Exception:
+            if s.stop_event.is_set():
+                return True
+            s.video = {"present": False, "state": "none"}
+            self._record_error(s, "YouTube player not found on the page (consent/sign-in page or blocked?)")
+            return False
+        res = await page.evaluate(YOUTUBE_START_JS, {"muted": muted})
+        if not res.get("present"):
+            s.video = {"present": False, "state": "none"}
+            self._record_error(s, "YouTube player not found on the page")
+            return False
+        if not res.get("started"):
+            s.video = {"present": True, "state": "error"}
+            self._record_error(s, f"YouTube playback failed to start: {res.get('error')}")
+            return False
+        self.db.log("info", f"{s.name}: YouTube single playback started (muted={muted}, loop=False)", session_id=s.id)
+        while not s.stop_event.is_set():
+            try:
+                st = await page.evaluate(YOUTUBE_STATUS_JS)
+            except Exception as exc:
+                if s.stop_event.is_set():
+                    return True
+                if vid and youtube_video_id(page.url) not in (vid, None):
+                    self.db.log("info", f"{s.name}: page moved to another video; ending without playing it",
+                                session_id=s.id)
+                    return True
+                self._record_error(s, f"Lost the YouTube page: {(str(exc).splitlines() or [''])[0]}")
+                return False
+            s.current_url = st.get("href") or page.url
+            if not st.get("present"):
+                self._record_error(s, "YouTube player disappeared")
+                return False
+            s.video = {**video_view({**st, "duration": st.get("duration")}, False),
+                       "player_api": st.get("player_api"), "player_state": st.get("player_state"),
+                       "ad_showing": st.get("ad_showing")}
+            if vid and youtube_video_id(s.current_url or "") not in (vid, None):
+                self.db.log("info", f"{s.name}: page moved to another video; ending without playing it",
+                            session_id=s.id)
+                return True
+            if st["state"] == "error":
+                self._record_error(s, f"YouTube media error: {st.get('error')}")
+                return False
+            if st["state"] == "ended":
+                self.db.log("info", f"{s.name}: YouTube playback ended — session stops (no replay)",
+                            session_id=s.id)
+                return True
+            try:
+                await asyncio.wait_for(s.stop_event.wait(), timeout=VIDEO_POLL_S)
+            except asyncio.TimeoutError:
+                pass
+        return True
 
     async def _video_cycle(self, s: TestSession, page: Page) -> None:
         """Load the page, start the first HTML5 <video>, then poll its state until stop or failure."""

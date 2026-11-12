@@ -50,9 +50,23 @@ def _validated_custom(body: CreateSessions) -> dict | None:
     if body.custom is None:
         raise HTTPException(status_code=400, detail="scenario 'custom' requires a 'custom' object with a URL")
     try:
-        target = settings.custom_policy.validate(body.custom.url)
+        target = settings.custom_policy.validate(body.custom.url, allow_youtube=True)
     except CustomURLError as exc:
         raise HTTPException(status_code=400, detail=f"URL not allowed: {exc}")
+    if target.media_kind == "youtube":
+        # YouTube single-session compatibility test: one session, one playback, nothing repeated.
+        problems = []
+        if body.count != 1:
+            problems.append("세션 수는 1개만 가능")
+        if body.custom.mode != "video":
+            problems.append("자동 새로고침(Page Load) 불가 — mode는 video만 가능")
+        if body.custom.loop:
+            problems.append("반복 재생(loop) 불가")
+        if problems:
+            raise HTTPException(status_code=400, detail="YouTube URL — 단일 세션 호환성 테스트만 가능합니다: "
+                                                        + ", ".join(problems))
+        return {"url": target.input_url, "nav_url": target.url, "kind": "youtube", "mode": "video",
+                "reload_interval_s": 0, "muted": body.custom.muted, "loop": False, "registered_at": time.time()}
     interval = max(settings.custom_min_reload_s, body.custom.reload_interval_s)
     # Snapshot of the form at registration time. Later edits in the UI never change it.
     return {"url": target.input_url, "nav_url": target.url, "kind": target.media_kind,
@@ -149,9 +163,12 @@ async def unregister_custom_host(host: str):
 async def validate_custom_url(body: ValidateURL):
     """Backend check of a custom URL (same rules the session uses). Never fetches the URL."""
     try:
-        t = settings.custom_policy.validate(body.url)
+        t = settings.custom_policy.validate(body.url, allow_youtube=True)
     except CustomURLError as exc:
         raise HTTPException(status_code=400, detail=f"URL not allowed: {exc}")
+    if t.media_kind == "youtube":
+        return {"ok": True, "url": t.url, "host": t.host, "local": False, "resolved_ips": t.ips,
+                "youtube_single_session": True, "verification_required": False, "verify_url": None}
     return {"ok": True, "url": t.url, "host": t.host, "local": t.local, "resolved_ips": t.ips,
             "verification_required": (not t.local) and settings.custom_policy.require_verification,
             "verify_url": None if t.local else t.verify_url}
@@ -174,10 +191,15 @@ async def create_sessions(body: CreateSessions):
         await manager.stop_all(reason="replace")
         for sid in list(manager.sessions):
             await manager.delete_session(sid)
+    if custom and custom["kind"] == "youtube" and not body.replace and any(
+            s.is_youtube for s in manager.sessions.values()):
+        raise HTTPException(status_code=409, detail="YouTube 세션은 1개만 등록할 수 있습니다")
     try:
         created = manager.create_sessions(body.count, body.scenario, body.name_prefix, custom=custom)
     except LimitError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     return [s.to_dict() for s in created]
 
 

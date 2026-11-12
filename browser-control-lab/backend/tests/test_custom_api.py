@@ -30,7 +30,8 @@ def start_one(client, url, **kw):
 # ---------------------------------------------------------------- API validation (backend)
 @pytest.mark.parametrize("url, needle", [
     ("https://not-allowed.example/", "not in the allowlist"),
-    ("https://www.youtube.com/watch?v=x", "third-party media/social platform"),
+    ("https://www.twitch.tv/somechannel", "third-party media/social platform"),
+    ("https://www.youtube.com/channel/x", "YouTube single-session test needs one video URL"),
     ("file:///etc/passwd", "Only http and https"),
     ("javascript:alert(1)", "Only http and https"),
     ("http://user:pw@localhost/", "Credentials"),
@@ -419,3 +420,136 @@ def test_register_refuses_platforms_and_bad_urls(server, url, needle):
     assert not r["registered"] and needle in r["blocked_reason"]
     p = server.post("/api/custom/probe", json={"url": url}).json()
     assert p["registrable_host"] is None
+
+
+# ================================================================ YouTube single-session compatibility test
+YT = f"http://www.youtube.com:{PORT}/watch?v=AAAAAAAAAAA"   # fake YouTube served by the test app
+
+
+@pytest.fixture
+def fake_youtube(server, monkeypatch):
+    """Serve a YouTube-like watch page (#movie_player + 2 s WebM). With ?next=1 the page 'autoplays'
+    another video when it ends, like YouTube does."""
+    import app.main as main
+    from fastapi.responses import HTMLResponse
+    monkeypatch.setattr(main.manager, "youtube_cooldown_s", 0)
+    main.manager._youtube_last_start = None
+    hits = []
+
+    async def watch(v: str = "", next: int = 0):
+        hits.append(v)
+        js = ("document.querySelector('video').addEventListener('ended', () => "
+              "{ location.href = '/watch?v=BBBBBBBBBBB'; });") if next else ""
+        return HTMLResponse(f'<!doctype html><title>fake yt</title><div id="movie_player">'
+                            f'<video src="/lab/static/test-2s.webm" muted playsinline></video></div><script>{js}</script>')
+    main.app.add_api_route("/watch", watch)
+    yield hits
+    main.app.router.routes[:] = [r for r in main.app.router.routes if getattr(r, "path", "") != "/watch"]
+    main.manager._youtube_last_start = None
+
+
+def yt_create(client, url=YT, count=1, **kw):
+    body = {"count": count, "scenario": "custom", "replace": kw.pop("replace", False),
+            "custom": {"url": url, "mode": kw.pop("mode", "video"), "loop": kw.pop("loop", False),
+                       "reload_interval_s": kw.pop("interval", 10), "muted": True}}
+    return client.post("/api/sessions", json=body)
+
+
+def test_youtube_urls_recognised(server):
+    for url in [YT, f"http://youtu.be:{PORT}/AAAAAAAAAAA", "https://www.youtube.com/shorts/AAAAAAAAAAA"]:
+        v = server.post("/api/custom/validate", json={"url": url})
+        assert v.status_code == 200 and v.json()["youtube_single_session"], v.text
+    r = yt_create(server, f"http://youtu.be:{PORT}/AAAAAAAAAAA")
+    assert r.status_code == 201 and r.json()[0]["custom"]["kind"] == "youtube" and r.json()[0]["youtube"]
+
+
+@pytest.mark.parametrize("kw, needle", [
+    ({"count": 2}, "세션 수는 1개만"),
+    ({"count": 100}, "세션 수는 1개만"),
+    ({"loop": True}, "loop"),
+    ({"mode": "page_load"}, "새로고침"),
+])
+def test_youtube_rejects_multi_loop_reload(server, kw, needle):
+    r = yt_create(server, **kw)
+    assert r.status_code == 400 and needle in r.json()["detail"], r.text
+    assert server.get("/api/state").json()["summary"]["total"] == 0
+
+
+def test_youtube_single_playback_then_stops(server, fake_youtube):
+    r = yt_create(server)
+    assert r.status_code == 201
+    sid = r.json()[0]["id"]
+    # a second YouTube session can be neither registered nor added through the API
+    assert yt_create(server).status_code == 409
+    assert server.get("/api/state").json()["summary"]["total"] == 1
+
+    assert server.post(f"/api/sessions/{sid}/start").status_code == 200
+    st = _wait(server, lambda st: _by_id(st, sid)["status"] in ("stopped", "error"), timeout=60)
+    s = _by_id(st, sid)
+    assert s["status"] == "stopped", s
+    assert s["errors"] == 0 and s["page_load_count"] == 1
+    assert s["video"]["state"] == "ended" and s["video"]["present"]
+    assert s["video"]["duration"] and s["peak_process_count"] > 0 and s["peak_memory_mb"]
+    assert find_lab_processes(f"{os.getpid()}:{sid}") == []
+    # nothing restarts after the end: the page was opened exactly once
+    import time
+    time.sleep(3)
+    s = _by_id(server.get("/api/state").json(), sid)
+    assert s["status"] == "stopped" and s["page_load_count"] == 1 and fake_youtube == ["AAAAAAAAAAA"]
+
+
+def test_youtube_autoplay_next_video_ends_run(server, fake_youtube):
+    sid = yt_create(server, YT + "&next=1").json()[0]["id"]
+    server.post(f"/api/sessions/{sid}/start")
+    st = _wait(server, lambda st: _by_id(st, sid)["status"] in ("stopped", "error"), timeout=60)
+    s = _by_id(st, sid)
+    assert s["status"] == "stopped" and s["page_load_count"] == 1, s
+    assert find_lab_processes(f"{os.getpid()}:{sid}") == []
+
+
+def test_youtube_cooldown_start_all_and_second_start(server, fake_youtube, monkeypatch):
+    import app.main as main
+    sid = yt_create(server).json()[0]["id"]
+    local = create(server, f"{LOCAL}/lab/basic", count=3).json()
+    # start-all never starts the YouTube session, but still starts the others
+    r = server.post("/api/sessions/start-all").json()
+    assert sid not in r["started"] and len(r["started"]) == 3
+    assert any(x["id"] == sid and "YouTube" in x["reason"] for x in r["skipped"])
+    server.post("/api/sessions/stop-all")
+
+    monkeypatch.setattr(main.manager, "youtube_cooldown_s", 600)
+    assert server.post(f"/api/sessions/{sid}/start").status_code == 200
+    # second start (manual or restart) while running / within the cooldown is refused
+    r2 = server.post(f"/api/sessions/{sid}/restart")
+    assert r2.status_code == 429 and "분에 한 번" in r2.json()["detail"], r2.text
+    assert _by_id(server.get("/api/state").json(), sid)["status"] in ("starting", "running")  # not stopped by it
+    st = _wait(server, lambda st: _by_id(st, sid)["status"] in ("stopped", "error"), timeout=60)
+    assert server.post(f"/api/sessions/{sid}/start").status_code == 429
+    assert all(_by_id(st, x["id"])["status"] != "running" for x in local)
+
+
+def test_youtube_stop_cleans_processes(server, fake_youtube):
+    import time
+    sid = yt_create(server).json()[0]["id"]
+    server.post(f"/api/sessions/{sid}/start")
+    _wait(server, lambda st: _by_id(st, sid)["status"] == "running", timeout=30)
+    time.sleep(0.5)
+    r = server.post("/api/sessions/stop-all").json()
+    assert r["verified_clean"] and r["remaining_processes"] == 0
+    assert find_lab_processes(f"{os.getpid()}:{sid}") == []
+
+
+def test_localhost_multi_session_still_allowed(server):
+    r = create(server, f"{LOCAL}/lab/video", mode="video", count=5, loop=True)
+    assert r.status_code == 201 and len(r.json()) == 5
+    r = server.post("/api/sessions/start-all").json()
+    assert len(r["started"]) == 5
+    server.post("/api/sessions/stop-all")
+
+
+@pytest.mark.parametrize("url", ["https://www.twitch.tv/x", "https://www.tiktok.com/@a/video/1",
+                                 "https://chzzk.naver.com/live/x", "https://www.instagram.com/reel/x"])
+def test_other_platforms_still_blocked(server, url):
+    for count in (1, 3):
+        r = create(server, url, mode="video", count=count, loop=False)
+        assert r.status_code == 400 and "third-party media/social platform" in r.json()["detail"]

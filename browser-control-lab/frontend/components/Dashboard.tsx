@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   api,
+  isYouTubeUrl,
   CustomConfig,
   CustomMode,
   LabConfig,
@@ -334,6 +335,10 @@ function Controls({ state, busy, run }: { state: LabState; busy: string | null; 
   }, []);
   const isCustom = scenario === "custom";
   const urlLooksOk = /^https?:\/\/[^\s/]+/i.test(custom.url.trim());
+  // YouTube URL → single-session compatibility test: 1 session, 1 playback, no loop / reload.
+  const isYouTube = isCustom && isYouTubeUrl(custom.url);
+  const effCount = isYouTube ? 1 : count;
+  const ytSession = state.sessions.find((s) => s.youtube);
   const canRegister = !isCustom || urlLooksOk;
   const existing = state.summary.total;
   const running = state.summary.running + state.summary.starting;
@@ -347,12 +352,20 @@ function Controls({ state, busy, run }: { state: LabState; busy: string | null; 
       () =>
         api("/api/sessions", {
           method: "POST",
-          body: JSON.stringify({ count, scenario, replace, ...(isCustom ? { custom: { ...custom, url: custom.url.trim() } } : {}) }),
+          body: JSON.stringify({
+            count: effCount,
+            scenario,
+            replace,
+            ...(isCustom
+              ? { custom: { ...custom, url: custom.url.trim(), ...(isYouTube ? { mode: "video", loop: false } : {}) } }
+              : {}),
+          }),
         }),
       (r) => {
         const base = replace ? `기존 ${existing}개를 삭제하고 ${r.length}개로 교체했습니다` : `${r.length}개 추가 등록 (총 ${existing + r.length}개)`;
         const c = r[0]?.custom;
         if (!c) return base;
+        if (c.kind === "youtube") return `${base} — YouTube 단일 세션 호환성 테스트: ${c.url} (1회 재생, 반복·새로고침 없음)`;
         const opts = c.mode === "video" ? `Video Playback, ${c.muted ? "muted" : "소리 켬"}, ${c.loop ? "loop" : "1회"}` : `Page Load, ${c.reload_interval_s}s`;
         return `${base} — URL: ${c.url} (${c.kind === "video_file" ? "직접 영상 파일" : "페이지"}, ${opts})`;
       },
@@ -366,8 +379,10 @@ function Controls({ state, busy, run }: { state: LabState; busy: string | null; 
           <input
             type="number"
             min={1}
-            max={100}
-            value={count}
+            max={isYouTube ? 1 : 100}
+            value={effCount}
+            disabled={isYouTube}
+            title={isYouTube ? "YouTube URL은 세션 1개만 가능합니다" : undefined}
             onChange={(e) => {
               setCount(Math.max(1, Math.min(100, Number(e.target.value) || 1)));
               setConfirming(false);
@@ -448,7 +463,18 @@ function Controls({ state, busy, run }: { state: LabState; busy: string | null; 
         </div>
       </div>
 
-      {isCustom && <CustomPanel custom={custom} setCustom={setCustom} config={config} reloadConfig={reloadConfig} urlLooksOk={urlLooksOk} sessions={state.sessions} />}
+      {isCustom && (
+        <CustomPanel
+          custom={custom}
+          setCustom={setCustom}
+          config={config}
+          reloadConfig={reloadConfig}
+          urlLooksOk={urlLooksOk}
+          sessions={state.sessions}
+          isYouTube={isYouTube}
+        />
+      )}
+      {ytSession && <YouTubeReport s={ytSession} system={state.system} />}
 
       {confirming && (
         <div
@@ -457,24 +483,25 @@ function Controls({ state, busy, run }: { state: LabState; busy: string | null; 
           className="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-100"
         >
           <p className="font-medium">
-            이미 {existing}개 세션이 등록되어 있습니다{running ? ` (실행 중 ${running}개)` : ""}. {count}개를 어떻게 등록할까요?
+            이미 {existing}개 세션이 등록되어 있습니다{running ? ` (실행 중 ${running}개)` : ""}. {effCount}개를 어떻게 등록할까요?
           </p>
           <ul className="mt-1 list-disc pl-5 text-xs">
             <li>
-              <b>교체</b>: 기존 세션을 모두 중지·삭제하고 정확히 {count}개만 남깁니다.
+              <b>교체</b>: 기존 세션을 모두 중지·삭제하고 정확히 {effCount}개만 남깁니다.
             </li>
             <li>
-              <b>추가</b>: 기존 {existing}개에 더해 총 {existing + count}개가 됩니다.
-              {existing + count > limit && ` 동시 실행 한도(${limit})를 넘으므로 '전체 시작' 시 ${limit}개까지만 실행됩니다.`}
-              {existing + count > state.summary.max_sessions && ` 최대 등록 수(${state.summary.max_sessions})를 넘어 등록할 수 없습니다.`}
+              <b>추가</b>: 기존 {existing}개에 더해 총 {existing + effCount}개가 됩니다.
+              {isYouTube && ytSession && " YouTube 세션이 이미 있어 추가할 수 없습니다(교체만 가능)."}
+              {existing + effCount > limit && ` 동시 실행 한도(${limit})를 넘으므로 '전체 시작' 시 ${limit}개까지만 실행됩니다.`}
+              {existing + effCount > state.summary.max_sessions && ` 최대 등록 수(${state.summary.max_sessions})를 넘어 등록할 수 없습니다.`}
             </li>
           </ul>
           <div className="mt-2 flex flex-wrap gap-2">
             <Btn variant="primary" disabled={!!busy} onClick={() => register(true)}>
-              기존 {existing}개 교체 → {count}개
+              기존 {existing}개 교체 → {effCount}개
             </Btn>
-            <Btn disabled={!!busy || count > remaining} onClick={() => register(false)}>
-              {count}개 추가 → 총 {existing + count}개
+            <Btn disabled={!!busy || effCount > remaining || (isYouTube && !!ytSession)} onClick={() => register(false)}>
+              {effCount}개 추가 → 총 {existing + effCount}개
             </Btn>
             <Btn disabled={!!busy} onClick={() => setConfirming(false)}>
               취소
@@ -579,7 +606,9 @@ function CustomPanel({
   reloadConfig,
   urlLooksOk,
   sessions,
+  isYouTube,
 }: {
+  isYouTube: boolean;
   custom: CustomForm;
   setCustom: (c: CustomForm) => void;
   config: LabConfig | null;
@@ -661,12 +690,17 @@ function CustomPanel({
         </label>
         <label className={lbl}>
           모드
-          <select value={custom.mode} onChange={(e) => set({ mode: e.target.value as CustomMode })} className={input}>
+          <select
+            value={isYouTube ? "video" : custom.mode}
+            disabled={isYouTube}
+            onChange={(e) => set({ mode: e.target.value as CustomMode })}
+            className={input}
+          >
             <option value="page_load">Page Load — 주기적 새로고침</option>
             <option value="video">Video Playback — HTML5 video 재생</option>
           </select>
         </label>
-        {custom.mode === "page_load" ? (
+        {custom.mode === "page_load" && !isYouTube ? (
           <label className={lbl}>
             새로고침 간격(초)
             <input
@@ -686,15 +720,43 @@ function CustomPanel({
               Muted
             </label>
             <label className="flex items-center gap-1.5 pb-2 text-sm">
-              <input type="checkbox" checked={custom.loop} onChange={(e) => set({ loop: e.target.checked })} />
+              <input
+                type="checkbox"
+                checked={isYouTube ? false : custom.loop}
+                disabled={isYouTube}
+                onChange={(e) => set({ loop: e.target.checked })}
+              />
               Loop (끝나면 처음부터)
             </label>
+            {isYouTube && (
+              <label className={lbl}>
+                새로고침 간격(초)
+                <input type="number" disabled value="" placeholder="사용 안 함" className={`${input} w-24`} />
+              </label>
+            )}
           </>
         )}
-        <Btn disabled={!urlLooksOk || probing} onClick={check} title="Chromium으로 URL을 한 번 열어 상태를 확인합니다 (입력값은 바뀌지 않습니다)">
+        <Btn
+          disabled={!urlLooksOk || probing || isYouTube}
+          onClick={check}
+          title={
+            isYouTube
+              ? "YouTube는 별도 확인 실행을 하지 않습니다. 세션 1개를 시작하면 그 결과가 측정됩니다."
+              : "Chromium으로 URL을 한 번 열어 상태를 확인합니다 (입력값은 바뀌지 않습니다)"
+          }
+        >
           {probing ? "확인 중…" : "URL 확인"}
         </Btn>
       </div>
+      {isYouTube && (
+        <div role="note" className="mt-2 rounded-md border border-red-300 bg-red-50 px-2 py-1.5 text-xs text-red-900 dark:border-red-800 dark:bg-red-950/40 dark:text-red-200">
+          <b>YouTube URL — 단일 세션 호환성 테스트만 가능합니다.</b>
+          <span className="block">
+            세션 1개 · 1회 재생 · Loop/새로고침/자동 재시도 없음 · 영상이 끝나면 세션이 정지됩니다. 전체 시작에서는 제외되며, 다시 실행하려면{" "}
+            10분이 지나야 합니다.
+          </span>
+        </div>
+      )}
       {!urlLooksOk && custom.url && <p className="mt-2 text-xs text-rose-700 dark:text-rose-400">http:// 또는 https:// 로 시작하는 URL을 입력하세요.</p>}
       {probeErr && <p className="mt-2 text-xs text-rose-700 dark:text-rose-400">{probeErr}</p>}
       {probe && (
@@ -811,6 +873,59 @@ const PAGE_LABEL: Record<Session["page_state"], string> = { idle: "대기", load
 
 function fmtSec(v: number | null | undefined) {
   return v == null ? "—" : `${v.toFixed(1)}s`;
+}
+
+/** Measurements of the YouTube single-session compatibility test. */
+function YouTubeReport({ s, system }: { s: Session; system: LabState["system"] }) {
+  const v = s.video;
+  const m = system.memory;
+  const active = ["starting", "running", "stopping"].includes(s.status);
+  const yes = (b: boolean | null | undefined) => <YesNo v={b} />;
+  const rows: [string, React.ReactNode][] = [
+    ["입력 URL", <span className="break-all font-mono">{s.custom?.url}</span>],
+    ["최종 URL", s.current_url ? <span className="break-all font-mono">{s.current_url}</span> : "—"],
+    ["세션 상태", s.status],
+    ["page loaded", s.page_state === "idle" ? "—" : yes(s.page_load_count > 0)],
+    ["YouTube player 발견", v ? yes(!!v.present) : "—"],
+    [
+      "playback state",
+      v && v.present ? <span className={`rounded px-1.5 py-0.5 ${VIDEO_STYLE[v.state] ?? ""}`}>{v.state}</span> : "—",
+    ],
+    ["현재 재생 시간", fmtSec(v?.current_time)],
+    ["duration", fmtSec(v?.duration)],
+    ["세션 실행시간", fmtDuration(s.uptime_s)],
+    [
+      "Chromium 프로세스 수",
+      active ? `${s.process_count}개 (최대 ${s.peak_process_count ?? 0})` : `0개 (실행 중 최대 ${s.peak_process_count ?? 0})`,
+    ],
+    [
+      "세션 메모리",
+      active && s.memory_mb != null
+        ? `${s.memory_mb.toFixed(0)} MB (최대 ${s.peak_memory_mb?.toFixed(0) ?? "—"} MB)`
+        : s.peak_memory_mb != null
+          ? `종료됨 · 실행 중 최대 ${s.peak_memory_mb.toFixed(0)} MB`
+          : "—",
+    ],
+    ["전체 CPU", `${system.cpu_percent}%`],
+    ["시스템 RAM", `${m.used_percent}% (${m.used_gb.toFixed(1)} / ${m.total_gb.toFixed(1)} GB)`],
+    ["Memory Pressure", m.pressure.level],
+    ["Swap", `${m.swap.used_gb.toFixed(2)} / ${m.swap.total_gb.toFixed(2)} GB`],
+    ["마지막 오류", s.last_error ? <span className="text-rose-700 dark:text-rose-400">{s.last_error}</span> : "—"],
+  ];
+  return (
+    <section aria-label="YouTube 단일 세션 호환성 테스트 결과" className="mt-3 rounded-lg border border-red-200 bg-red-50/40 p-3 dark:border-red-900 dark:bg-red-950/20">
+      <h3 className="text-sm font-semibold">YouTube Single Session — 호환성 테스트 ({s.name})</h3>
+      <p className="text-xs text-slate-500 dark:text-slate-400">1회 재생 후 자동 정지 · 반복/새로고침/재시도 없음</p>
+      <dl className="mt-2 grid grid-cols-[10rem_1fr] gap-x-3 gap-y-0.5 text-xs">
+        {rows.map(([k, val]) => (
+          <div key={k} className="contents">
+            <dt className="text-slate-500">{k}</dt>
+            <dd>{val}</dd>
+          </div>
+        ))}
+      </dl>
+    </section>
+  );
 }
 
 function TargetCell({ s }: { s: Session }) {

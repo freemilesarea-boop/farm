@@ -24,11 +24,12 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import re
 import secrets
 import socket
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 VERIFY_PATH = "/.well-known/blc-lab-verify.txt"
@@ -53,6 +54,64 @@ BLOCKED_PLATFORM_DOMAINS = frozenset({
     # audio
     "spotify.com", "soundcloud.com", "music.apple.com", "melon.com", "genie.co.kr",
 })
+
+
+# ---------------------------------------------------------------------- YouTube single session
+# The one exception to the platform block: a *single* compatibility check of one YouTube
+# video (one browser, one playback, no reload/loop/retry; enforced in main + session_manager).
+# Every other platform, and YouTube for any multi-session / repeat use, stays blocked.
+YOUTUBE_PAGE_HOSTS = frozenset({"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"})
+# Sub-resource domains the YouTube watch page needs (player JS, thumbnails, media segments, fonts).
+YOUTUBE_RESOURCE_SUFFIXES = ("youtube.com", "youtu.be", "googlevideo.com", "ytimg.com", "ggpht.com",
+                             "gstatic.com", "googleapis.com", "google.com", "googleusercontent.com",
+                             "doubleclick.net")
+_YT_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+
+def is_youtube_host(host: str) -> bool:
+    return host in YOUTUBE_PAGE_HOSTS
+
+
+def youtube_video_id(url: str) -> str | None:
+    """Video id of a youtube.com/watch?v=, /shorts/<id>, /live/<id> or youtu.be/<id> URL, else None."""
+    try:
+        parts = urlsplit(url.strip())
+        host = _norm_host(parts.hostname or "")
+    except (ValueError, CustomURLError):
+        return None
+    if host not in YOUTUBE_PAGE_HOSTS:
+        return None
+    path = parts.path or "/"
+    if host == "youtu.be":
+        vid = path.strip("/").split("/")[0]
+    elif path.rstrip("/") == "/watch":
+        vid = parse_qs(parts.query).get("v", [""])[0]
+    else:
+        seg = path.strip("/").split("/")
+        vid = seg[1] if len(seg) >= 2 and seg[0] in ("shorts", "live") else ""
+    return vid if _YT_ID.match(vid or "") else None
+
+
+def youtube_host_allowed(url: str, *, navigation: bool) -> bool:
+    """Route-guard rule for the YouTube single session: pages only on YouTube's own hosts,
+    sub-resources only on the fixed YouTube/Google suffix list. IP literals never."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    if parts.scheme in ("data", "blob", "about"):
+        return True
+    if parts.scheme not in ("http", "https", "ws", "wss") or parts.username or parts.password:
+        return False
+    try:
+        host = _norm_host(parts.hostname or "")
+    except CustomURLError:
+        return False
+    if not host or _is_ip(host):
+        return host in LOCAL_HOSTS and not navigation
+    if navigation:
+        return host in YOUTUBE_PAGE_HOSTS or host.endswith(".youtube.com")
+    return any(host == d or host.endswith("." + d) for d in YOUTUBE_RESOURCE_SUFFIXES)
 
 
 # Direct video files Chromium can play in an HTML5 <video> (codec support permitting).
@@ -214,7 +273,7 @@ class CustomPolicy:
         return ips
 
     # ------------------------------------------------------------------ validation
-    def validate(self, url: str, *, resolve: bool = True) -> "ValidatedTarget":
+    def validate(self, url: str, *, resolve: bool = True, allow_youtube: bool = False) -> "ValidatedTarget":
         if not isinstance(url, str) or not url.strip():
             raise CustomURLError("URL is empty")
         url = url.strip()
@@ -234,6 +293,14 @@ class CustomPolicy:
         if not parts.hostname:
             raise CustomURLError("URL has no host")
         host = _norm_host(parts.hostname)
+        if allow_youtube and is_youtube_host(host):
+            vid = youtube_video_id(url)
+            if not vid:
+                raise CustomURLError("YouTube single-session test needs one video URL "
+                                     "(youtube.com/watch?v=..., youtu.be/..., /shorts/...)")
+            ips = self.resolve(host) if resolve else []
+            return ValidatedTarget(url=url, host=host, scheme=parts.scheme, port=port, local=False, ips=ips,
+                                   input_url=url, media_kind="youtube")
         plat = blocked_platform(host)
         if plat:
             raise CustomURLError(
@@ -291,6 +358,26 @@ class CustomPolicy:
         rules += ["MAP * ~NOTFOUND", "EXCLUDE localhost", "EXCLUDE 127.0.0.1"]
         return ", ".join(rules)
 
+    def youtube_resolver_rules(self) -> str:
+        """Resolver rules for the YouTube single session: YouTube/Google suffixes use normal DNS
+        (media hosts are dynamic), every other name stays NOTFOUND. Host overrides (tests,
+        staging) are pinned and take precedence over the suffix exclusion."""
+        pinned = {h: ip for h, ip in self.host_overrides.items()
+                  if any(h == d or h.endswith("." + d) for d in YOUTUBE_RESOURCE_SUFFIXES)}
+        rules = [f"MAP {h} {'[' + ip + ']' if ':' in ip else ip}" for h, ip in pinned.items()]
+        rules += ["MAP * ~NOTFOUND", "EXCLUDE localhost", "EXCLUDE 127.0.0.1"]
+        for d in YOUTUBE_RESOURCE_SUFFIXES:
+            if not any(h == d or h.endswith("." + d) for h in pinned):
+                rules += [f"EXCLUDE {d}", f"EXCLUDE *.{d}"]
+        return ", ".join(rules)
+
+    @staticmethod
+    def youtube_proxy_args() -> list[str]:
+        bypass = ["localhost", "127.0.0.1", "[::1]"]
+        for d in YOUTUBE_RESOURCE_SUFFIXES:
+            bypass += [d, f"*.{d}"]
+        return [f"--proxy-server=http://{DEAD_PROXY_HOST}:1", f"--proxy-bypass-list={';'.join(bypass)}"]
+
     def proxy_args(self) -> list[str]:
         """Network-level allowlist that does not depend on Playwright request interception.
 
@@ -325,7 +412,7 @@ class ValidatedTarget:
     local: bool
     ips: list[str]
     input_url: str = ""  # exactly what the user entered (trimmed)
-    media_kind: str = "page"  # "video_file" when the path is a direct video file
+    media_kind: str = "page"  # "video_file" when the path is a direct video file, "youtube" for the single-session test
 
     @property
     def origin(self) -> str:

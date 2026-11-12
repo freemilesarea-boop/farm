@@ -165,6 +165,25 @@ cd frontend && npm run dev
 - 외부 미디어/SNS 플랫폼, 사설 IP(옵트인 없을 때), 잘못된 URL은 등록되지 않습니다. 등록 후에도 SSRF·리다이렉트 검사는 그대로 적용됩니다.
 - 등록한 도메인은 대시보드 "대시보드에서 등록한 도메인"의 **해제**로 지웁니다.
 
+### YouTube 단일 세션 호환성 테스트
+
+YouTube 영상 URL이 Playwright Chromium에서 열리고 재생되는지 **브라우저 1개로 한 번만** 확인하는 기능입니다. 조회수·시청시간을 반복해서 만드는 용도로는 쓸 수 없도록 서버에서 제한합니다.
+
+- 대상: `youtube.com/watch?v=…`, `youtu.be/…`, `youtube.com/shorts/…`, `/live/…` 영상 URL. 채널·목록 페이지는 거부합니다.
+- 서버 측 강제 제한(API 직접 호출 포함):
+  - 세션 수는 1개만 가능합니다. YouTube 세션은 1개만 등록되고, 두 번째 등록은 409로 거부합니다.
+  - mode는 `video`만 가능하고 `loop=false`만 허용합니다. 위반하면 400으로 거부합니다.
+  - 페이지는 1회만 엽니다. 재생은 1회이고, 끝나면 브라우저를 닫고 세션이 `stopped`가 됩니다.
+  - 새로고침, 재시작, 재시도는 하지 않습니다. 실패하면 바로 `error`로 끝납니다. 다음 영상으로 자동 이동하면 그 영상은 재생하지 않고 종료합니다.
+  - **전체 시작**에서는 제외합니다. 개별 시작만 가능합니다.
+  - 실행 간 **쿨다운은 10분**입니다. 쿨다운 중 시작이나 재시작은 429로 거부합니다.
+- 네트워크: YouTube·Google 도메인 목록(youtube.com, googlevideo.com, ytimg.com 등)만 열립니다. IP 리터럴과 그 밖의 호스트는 기존처럼 차단합니다.
+- 대시보드 결과 패널 항목은 다음과 같습니다.
+  - 입력/최종 URL, page loaded, player 발견 여부, playback state, 현재 시간과 duration
+  - 실행시간, Chromium 프로세스 수, 세션 메모리(최대값 포함)
+  - CPU, RAM, Memory Pressure, Swap, 마지막 오류
+- 이 예외는 YouTube 단일 세션에만 적용됩니다. allowlist 등록, URL 확인(probe), 다중 세션에서는 YouTube를 포함한 모든 제3자 플랫폼을 계속 차단합니다.
+
 ### allowlist 설정 (`lab.env`)
 
 ```
